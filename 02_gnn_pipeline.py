@@ -20,7 +20,7 @@ GNN_CONFIG = {
     "pipeline_output_dir": Path("pipeline_outputs"),
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "seed": 42,
-    "node_feat_dim": 8,
+    "node_feat_dim": 14,
     "hidden_dim": 128,
     "embed_dim": 64,
     "num_heads": 4,
@@ -49,6 +49,7 @@ if metadata_path.exists():
     metadata = torch.load(str(metadata_path), weights_only=False)
     mask_dir = GNN_CONFIG["pipeline_output_dir"] / "masks"
     masks = []
+    raw_images = []
     image_paths = metadata["image_paths"]
     tumor_types = metadata["tumor_types"]
     type_confidences = metadata["type_confidences"]
@@ -58,13 +59,22 @@ if metadata_path.exists():
         m = torch.load(str(mask_dir / mf), weights_only=True)
         masks.append(m)
 
-    print(f"Loaded {len(masks)} masks from pipeline outputs")
+    for ip in image_paths:
+        img = cv2.imread(str(ip), cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            img = cv2.resize(img, (GNN_CONFIG["img_size"], GNN_CONFIG["img_size"]))
+            raw_images.append(img.astype(np.float32) / 255.0)
+        else:
+            raw_images.append(np.random.rand(GNN_CONFIG["img_size"], GNN_CONFIG["img_size"]).astype(np.float32))
+
+    print(f"Loaded {len(masks)} masks and {len(raw_images)} raw images from pipeline outputs")
     print(f"Tumor type distribution: {dict(zip(*np.unique(tumor_types, return_counts=True)))}")
 
 else:
     print("No pipeline outputs found. Generating synthetic masks for standalone testing.")
     num_synthetic = 200
     masks = []
+    raw_images = []
     image_paths = [f"synthetic_{i}.png" for i in range(num_synthetic)]
     tumor_types = [random.randint(0, 2) for _ in range(num_synthetic)]
     type_confidences = [random.uniform(0.7, 0.99) for _ in range(num_synthetic)]
@@ -86,8 +96,9 @@ else:
             ellipse = ((x_coords - cx).float() / rx) ** 2 + ((y_coords - cy).float() / ry) ** 2
             mask[ellipse <= 1.0] = 1.0
         masks.append(mask)
+        raw_images.append(np.random.rand(GNN_CONFIG["img_size"], GNN_CONFIG["img_size"]).astype(np.float32))
 
-    print(f"Generated {len(masks)} synthetic masks")
+    print(f"Generated {len(masks)} synthetic masks with synthetic raw images")
 
 fig, axes = plt.subplots(1, 4, figsize=(16, 4))
 for i in range(min(4, len(masks))):
@@ -105,7 +116,31 @@ class MaskToGraph:
     def __init__(self, config):
         self.config = config
 
-    def extract_regions(self, mask_np):
+    @staticmethod
+    def _raw_region_features(raw_img, component_mask):
+        pixels = raw_img[component_mask == 1]
+        if len(pixels) == 0:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        raw_mean = float(np.mean(pixels))
+        raw_std = float(np.std(pixels))
+        raw_range = float(np.max(pixels) - np.min(pixels))
+        mean_val = np.mean(pixels)
+        skewness = float(np.mean(((pixels - mean_val) / max(np.std(pixels), 1e-8)) ** 3))
+        kernel = np.ones((3, 3), dtype=np.float32) / 9.0
+        local_mean = cv2.filter2D(raw_img, -1, kernel)
+        local_var = cv2.filter2D((raw_img - local_mean) ** 2, -1, kernel)
+        texture_contrast = float(np.mean(local_var[component_mask == 1]))
+        dilated = cv2.dilate(component_mask, np.ones((3, 3), np.uint8), iterations=1)
+        boundary = dilated - component_mask
+        if boundary.sum() > 0:
+            inner_vals = raw_img[component_mask == 1].mean()
+            outer_vals = raw_img[boundary == 1].mean()
+            boundary_gradient = float(abs(inner_vals - outer_vals))
+        else:
+            boundary_gradient = 0.0
+        return raw_mean, raw_std, raw_range, skewness, boundary_gradient, texture_contrast
+
+    def extract_regions(self, mask_np, raw_img=None):
         mask_uint8 = (mask_np * 255).astype(np.uint8)
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
             mask_uint8, connectivity=8
@@ -127,6 +162,11 @@ class MaskToGraph:
             solidity = area / bbox_area
             aspect_ratio = w / max(h, 1)
 
+            if raw_img is not None:
+                raw_mean, raw_std, raw_range, skewness, boundary_grad, texture = self._raw_region_features(raw_img, component_mask)
+            else:
+                raw_mean, raw_std, raw_range, skewness, boundary_grad, texture = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
             regions.append({
                 "centroid": (cx, cy),
                 "area": area,
@@ -135,11 +175,17 @@ class MaskToGraph:
                 "mean_intensity": float(mean_intensity),
                 "aspect_ratio": aspect_ratio,
                 "solidity": solidity,
+                "raw_mean": raw_mean,
+                "raw_std": raw_std,
+                "raw_range": raw_range,
+                "skewness": skewness,
+                "boundary_gradient": boundary_grad,
+                "texture_contrast": texture,
             })
 
         return regions
 
-    def split_into_grid(self, mask_np, n_splits):
+    def split_into_grid(self, mask_np, n_splits, raw_img=None):
         h, w = mask_np.shape
         regions = []
         cell_h = h // n_splits
@@ -152,6 +198,12 @@ class MaskToGraph:
                 area = float(cell.sum())
                 cy = i * cell_h + cell_h / 2
                 cx = j * cell_w + cell_w / 2
+                cell_mask = (cell > 0).astype(np.uint8)
+                if raw_img is not None:
+                    raw_cell = raw_img[i * cell_h:(i + 1) * cell_h, j * cell_w:(j + 1) * cell_w]
+                    raw_mean, raw_std, raw_range, skewness, boundary_grad, texture = self._raw_region_features(raw_cell, cell_mask)
+                else:
+                    raw_mean, raw_std, raw_range, skewness, boundary_grad, texture = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
                 regions.append({
                     "centroid": (cx, cy),
                     "area": area,
@@ -160,6 +212,12 @@ class MaskToGraph:
                     "mean_intensity": float(cell.mean()),
                     "aspect_ratio": float(cell_w) / max(float(cell_h), 1),
                     "solidity": area / max(cell_w * cell_h, 1),
+                    "raw_mean": raw_mean,
+                    "raw_std": raw_std,
+                    "raw_range": raw_range,
+                    "skewness": skewness,
+                    "boundary_gradient": boundary_grad,
+                    "texture_contrast": texture,
                 })
         return regions
 
@@ -176,11 +234,17 @@ class MaskToGraph:
                 r["mean_intensity"],
                 r["aspect_ratio"],
                 r["solidity"],
+                r["raw_mean"],
+                r["raw_std"],
+                r["raw_range"],
+                r["skewness"],
+                r["boundary_gradient"],
+                r["texture_contrast"],
             ]
             features.append(feat)
         return torch.tensor(features, dtype=torch.float32)
 
-    def convert(self, mask_tensor):
+    def convert(self, mask_tensor, raw_img=None):
         mask_np = mask_tensor.numpy()
 
         if mask_np.sum() < 5:
@@ -189,10 +253,10 @@ class MaskToGraph:
             pos = torch.tensor([[0.5, 0.5]], dtype=torch.float32)
             return Data(x=x, edge_index=edge_index, pos=pos, edge_attr=torch.zeros(0, 2))
 
-        regions = self.extract_regions(mask_np)
+        regions = self.extract_regions(mask_np, raw_img=raw_img)
 
         if len(regions) < self.config["min_nodes_per_graph"]:
-            grid_regions = self.split_into_grid(mask_np, self.config["grid_split"])
+            grid_regions = self.split_into_grid(mask_np, self.config["grid_split"], raw_img=raw_img)
             if len(grid_regions) >= self.config["min_nodes_per_graph"]:
                 regions = grid_regions
             else:
@@ -229,7 +293,7 @@ class MaskToGraph:
 converter = MaskToGraph(GNN_CONFIG)
 graphs = []
 for i, mask in enumerate(masks):
-    g = converter.convert(mask)
+    g = converter.convert(mask, raw_img=raw_images[i])
     g.tumor_type = tumor_types[i]
     g.confidence = type_confidences[i]
     g.img_path = image_paths[i]

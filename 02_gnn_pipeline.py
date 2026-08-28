@@ -8,7 +8,7 @@ import random
 from pathlib import Path
 from sklearn.metrics import confusion_matrix
 from torch_geometric.data import Data, Batch
-from torch_geometric.nn import GATConv, BatchNorm, knn_graph
+from torch_geometric.nn import GATv2Conv, LayerNorm, knn_graph
 from torch_geometric.utils import negative_sampling, to_undirected
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from sklearn.metrics import roc_auc_score, average_precision_score
@@ -21,16 +21,20 @@ GNN_CONFIG = {
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "seed": 42,
     "node_feat_dim": 8,
-    "hidden_dim": 64,
-    "embed_dim": 32,
+    "hidden_dim": 128,
+    "embed_dim": 64,
+    "num_heads": 4,
+    "num_layers": 3,
     "k_neighbors": 5,
-    "gnn_epochs": 50,
-    "gnn_lr": 1e-3,
-    "gnn_weight_decay": 1e-5,
+    "gnn_epochs": 80,
+    "gnn_lr": 5e-4,
+    "gnn_weight_decay": 1e-4,
     "neg_sampling_ratio": 1.0,
     "min_nodes_per_graph": 3,
     "grid_split": 4,
     "img_size": 224,
+    "structural_feat_dim": 3,
+    "edge_attr_dim": 2,
 }
 
 torch.manual_seed(GNN_CONFIG["seed"])
@@ -237,6 +241,54 @@ print(f"Converted {len(graphs)} masks to graphs")
 print(f"Nodes per graph: min={min(node_counts)}, max={max(node_counts)}, mean={np.mean(node_counts):.1f}")
 print(f"Edges per graph: min={min(edge_counts)}, max={max(edge_counts)}, mean={np.mean(edge_counts):.1f}")
 
+
+class StructuralFeatureComputer:
+    @staticmethod
+    def get_neighbors(edge_index, num_nodes):
+        adj = [set() for _ in range(num_nodes)]
+        for i in range(edge_index.size(1)):
+            s, t = edge_index[0, i].item(), edge_index[1, i].item()
+            adj[s].add(t)
+            adj[t].add(s)
+        return adj
+
+    @staticmethod
+    def compute(edge_index, num_nodes, candidate_edges):
+        adj = StructuralFeatureComputer.get_neighbors(edge_index, num_nodes)
+        degrees = [len(adj[n]) for n in range(num_nodes)]
+        max_degree = max(degrees) if degrees else 1
+
+        cn_counts = []
+        jaccards = []
+        adamic_adars = []
+        cn_indices_list = []
+
+        for i in range(candidate_edges.size(1)):
+            s = candidate_edges[0, i].item()
+            t = candidate_edges[1, i].item()
+            cn = adj[s] & adj[t]
+            cn_list = list(cn)
+
+            cn_count = len(cn) / max(max_degree, 1)
+            union_size = len(adj[s] | adj[t])
+            jaccard = len(cn) / max(union_size, 1)
+            aa = sum(1.0 / max(np.log(degrees[w]), 1e-6) for w in cn_list) if cn_list else 0.0
+            aa = aa / max(num_nodes, 1)
+
+            cn_counts.append(cn_count)
+            jaccards.append(jaccard)
+            adamic_adars.append(aa)
+            cn_indices_list.append(cn_list)
+
+        feats = torch.tensor(
+            list(zip(cn_counts, jaccards, adamic_adars)),
+            dtype=torch.float32,
+        )
+        return feats, cn_indices_list
+
+sf_computer = StructuralFeatureComputer()
+print("StructuralFeatureComputer initialized")
+
 fig, axes = plt.subplots(2, 4, figsize=(20, 10))
 sample_indices = random.sample(range(len(graphs)), min(4, len(graphs)))
 for col, idx in enumerate(sample_indices):
@@ -274,76 +326,104 @@ plt.show()
 
 
 
-class GNNEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, heads=4, dropout=0.2):
+class NCNEncoder(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, num_layers=3, heads=4, edge_dim=2, dropout=0.2):
         super().__init__()
-        self.conv1 = GATConv(in_dim, hidden_dim, heads=heads, dropout=dropout)
-        self.bn1 = BatchNorm(hidden_dim * heads)
-        self.conv2 = GATConv(hidden_dim * heads, out_dim, heads=1, concat=False, dropout=dropout)
-        self.bn2 = BatchNorm(out_dim)
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        for _ in range(num_layers):
+            self.convs.append(GATv2Conv(hidden_dim, hidden_dim // heads, heads=heads, edge_dim=edge_dim, dropout=dropout, concat=True))
+            self.norms.append(LayerNorm(hidden_dim))
+        self.out_proj = nn.Linear(hidden_dim, out_dim)
         self.dropout = dropout
+        self.num_layers = num_layers
 
-    def forward(self, x, edge_index, return_attention=False):
-        if return_attention:
-            x, (ei1, alpha1) = self.conv1(x, edge_index, return_attention_weights=True)
-        else:
-            x = self.conv1(x, edge_index)
-            alpha1 = None
-        x = self.bn1(x)
-        x = F.elu(x)
-        x = F.dropout(x, p=self.dropout, training=self.training)
+    def forward(self, x, edge_index, edge_attr=None, return_attention=False):
+        x = self.input_proj(x)
+        alphas = []
+        for i, (conv, norm) in enumerate(zip(self.convs, self.norms)):
+            residual = x
+            if return_attention:
+                x, (_, alpha) = conv(x, edge_index, edge_attr=edge_attr, return_attention_weights=True)
+                alphas.append(alpha)
+            else:
+                x = conv(x, edge_index, edge_attr=edge_attr)
+            x = norm(x)
+            x = x + residual
+            if i < self.num_layers - 1:
+                x = F.elu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+        out = self.out_proj(x)
+        return out, alphas
 
-        if return_attention:
-            x, (ei2, alpha2) = self.conv2(x, edge_index, return_attention_weights=True)
-        else:
-            x = self.conv2(x, edge_index)
-            alpha2 = None
-        x = self.bn2(x)
 
-        return x, alpha1, alpha2
-
-
-class EdgeDecoder(nn.Module):
-    def __init__(self, embed_dim):
+class NCNEdgeDecoder(nn.Module):
+    def __init__(self, embed_dim, structural_feat_dim=3):
         super().__init__()
+        self.sf_proj = nn.Linear(structural_feat_dim, embed_dim)
+        cat_dim = embed_dim + embed_dim * 2 + embed_dim + embed_dim
         self.mlp = nn.Sequential(
+            nn.LayerNorm(cat_dim),
+            nn.Linear(cat_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.3),
             nn.Linear(embed_dim * 2, embed_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(0.2),
             nn.Linear(embed_dim, 1),
         )
 
-    def forward(self, z, edge_index):
+    def forward(self, z, edge_index, structural_feats, cn_indices_list):
         src_z = z[edge_index[0]]
         dst_z = z[edge_index[1]]
-        cat = torch.cat([src_z, dst_z], dim=1)
-        return self.mlp(cat).squeeze(-1)
+
+        hadamard = src_z * dst_z
+        pair_cat = torch.cat([src_z, dst_z], dim=1)
+
+        cn_pool = torch.zeros(edge_index.size(1), z.size(1), device=z.device)
+        for i, cn_list in enumerate(cn_indices_list):
+            if len(cn_list) > 0:
+                cn_embeds = z[cn_list]
+                cn_pool[i] = cn_embeds.mean(dim=0)
+
+        sf_embed = self.sf_proj(structural_feats.to(z.device))
+
+        combined = torch.cat([hadamard, pair_cat, cn_pool, sf_embed], dim=1)
+        return self.mlp(combined).squeeze(-1)
 
 
-class EdgePredictor(nn.Module):
+class NCNEdgePredictor(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.encoder = GNNEncoder(
+        self.encoder = NCNEncoder(
             in_dim=config["node_feat_dim"],
             hidden_dim=config["hidden_dim"],
             out_dim=config["embed_dim"],
+            num_layers=config["num_layers"],
+            heads=config["num_heads"],
+            edge_dim=config["edge_attr_dim"],
         )
-        self.decoder = EdgeDecoder(config["embed_dim"])
+        self.decoder = NCNEdgeDecoder(
+            embed_dim=config["embed_dim"],
+            structural_feat_dim=config["structural_feat_dim"],
+        )
 
     def encode(self, data, return_attention=False):
-        return self.encoder(data.x, data.edge_index, return_attention=return_attention)
+        edge_attr = data.edge_attr if hasattr(data, 'edge_attr') and data.edge_attr is not None and data.edge_attr.size(0) > 0 else None
+        return self.encoder(data.x, data.edge_index, edge_attr=edge_attr, return_attention=return_attention)
 
-    def decode(self, z, edge_index):
-        return self.decoder(z, edge_index)
+    def decode(self, z, edge_index, structural_feats, cn_indices_list):
+        return self.decoder(z, edge_index, structural_feats, cn_indices_list)
 
-    def forward(self, data, pos_edge_index, neg_edge_index, return_attention=False):
-        z, alpha1, alpha2 = self.encode(data, return_attention=return_attention)
-        pos_pred = self.decode(z, pos_edge_index)
-        neg_pred = self.decode(z, neg_edge_index)
-        return pos_pred, neg_pred, z, alpha1, alpha2
+    def forward(self, data, pos_edge_index, neg_edge_index, pos_sf, neg_sf, pos_cn, neg_cn, return_attention=False):
+        z, alphas = self.encode(data, return_attention=return_attention)
+        pos_pred = self.decode(z, pos_edge_index, pos_sf, pos_cn)
+        neg_pred = self.decode(z, neg_edge_index, neg_sf, neg_cn)
+        return pos_pred, neg_pred, z, alphas
 
-print(f"EdgePredictor initialized")
-model = EdgePredictor(GNN_CONFIG).to(GNN_CONFIG["device"])
+print(f"NCNEdgePredictor initialized")
+model = NCNEdgePredictor(GNN_CONFIG).to(GNN_CONFIG["device"])
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Total parameters: {total_params:,}")
 
@@ -353,7 +433,7 @@ class ReasoningTraceGenerator:
     def __init__(self, idx_to_class):
         self.idx_to_class = idx_to_class
 
-    def generate(self, data, z, edge_index, edge_probs, alpha_weights=None):
+    def generate(self, data, z, edge_index, edge_probs, alphas=None, structural_feats=None, cn_indices_list=None):
         traces = []
         pos_np = data.pos.cpu().numpy() if data.pos is not None else None
         x_np = data.x.cpu().numpy()
@@ -361,7 +441,7 @@ class ReasoningTraceGenerator:
         for i in range(edge_index.size(1)):
             src = edge_index[0, i].item()
             dst = edge_index[1, i].item()
-            prob = torch.sigmoid(edge_probs[i]).item() if edge_probs[i].dim() == 0 else torch.sigmoid(edge_probs[i]).item()
+            prob = torch.sigmoid(edge_probs[i]).item()
 
             trace = {
                 "edge_id": i,
@@ -391,8 +471,17 @@ class ReasoningTraceGenerator:
             ))
             trace["embedding_cosine_similarity"] = round(cosine_sim, 4)
 
-            if alpha_weights is not None:
-                trace["attention_weight_mean"] = round(float(alpha_weights.mean().item()), 4)
+            if structural_feats is not None and i < structural_feats.size(0):
+                trace["cn_count"] = round(float(structural_feats[i, 0]), 4)
+                trace["jaccard"] = round(float(structural_feats[i, 1]), 4)
+                trace["adamic_adar"] = round(float(structural_feats[i, 2]), 4)
+
+            if cn_indices_list is not None and i < len(cn_indices_list):
+                trace["common_neighbors"] = cn_indices_list[i]
+
+            if alphas is not None and len(alphas) > 0:
+                layer_means = [round(float(a.mean().item()), 4) for a in alphas]
+                trace["attention_per_layer"] = layer_means
 
             reasons = []
             if trace.get("spatial_distance", 0) < 30:
@@ -411,6 +500,14 @@ class ReasoningTraceGenerator:
                 reasons.append("moderate embedding similarity")
             else:
                 reasons.append("low embedding similarity suggests distinct morphological profiles")
+
+            cn_count = trace.get("cn_count", 0)
+            if cn_count > 0.3:
+                reasons.append(f"strong common neighbor overlap (CN={cn_count:.2f}, Jaccard={trace.get('jaccard', 0):.2f})")
+            elif cn_count > 0:
+                reasons.append(f"weak common neighbor signal (CN={cn_count:.2f})")
+            else:
+                reasons.append("no common neighbors")
 
             if prob > 0.8:
                 verdict = "strong link"
@@ -475,6 +572,29 @@ if len(test_graphs) == 0:
 
 print(f"Train graphs: {len(train_graphs)} | Test graphs: {len(test_graphs)}")
 
+steps_per_epoch = max(len(train_graphs), 1)
+scheduler = optim.lr_scheduler.OneCycleLR(
+    optimizer,
+    max_lr=GNN_CONFIG["gnn_lr"],
+    steps_per_epoch=steps_per_epoch,
+    epochs=GNN_CONFIG["gnn_epochs"],
+)
+
+def degree_biased_negative_sampling(edge_index, num_nodes, num_neg_samples):
+    deg = torch.zeros(num_nodes, dtype=torch.float)
+    for i in range(edge_index.size(1)):
+        deg[edge_index[0, i].item()] += 1
+        deg[edge_index[1, i].item()] += 1
+    prob = (deg + 1.0)
+    prob = prob / prob.sum()
+    neg_src = torch.multinomial(prob, num_neg_samples, replacement=True)
+    neg_dst = torch.multinomial(prob, num_neg_samples, replacement=True)
+    mask = neg_src != neg_dst
+    neg_src, neg_dst = neg_src[mask], neg_dst[mask]
+    if neg_src.size(0) == 0:
+        return negative_sampling(edge_index, num_nodes=num_nodes, num_neg_samples=num_neg_samples)
+    return torch.stack([neg_src, neg_dst], dim=0)
+
 for epoch in range(GNN_CONFIG["gnn_epochs"]):
     model.train()
     epoch_loss = 0.0
@@ -489,25 +609,29 @@ for epoch in range(GNN_CONFIG["gnn_epochs"]):
         train_ei = train_ei.to(GNN_CONFIG["device"])
 
         num_nodes = data.x.size(0)
-        neg_ei = negative_sampling(
-            train_ei,
-            num_nodes=num_nodes,
+        neg_ei = degree_biased_negative_sampling(
+            train_ei, num_nodes=num_nodes,
             num_neg_samples=train_ei.size(1),
-        )
+        ).to(GNN_CONFIG["device"])
+
+        pos_sf, pos_cn = sf_computer.compute(data.edge_index.cpu(), num_nodes, train_ei.cpu())
+        neg_sf, neg_cn = sf_computer.compute(data.edge_index.cpu(), num_nodes, neg_ei.cpu())
 
         optimizer.zero_grad()
-        pos_pred, neg_pred, z, _, _ = model(data, train_ei, neg_ei)
+        pos_pred, neg_pred, z, _ = model(data, train_ei, neg_ei, pos_sf, neg_sf, pos_cn, neg_cn)
 
         pos_loss = F.binary_cross_entropy_with_logits(pos_pred, torch.ones_like(pos_pred))
         neg_loss = F.binary_cross_entropy_with_logits(neg_pred, torch.zeros_like(neg_pred))
         loss = pos_loss + neg_loss
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        scheduler.step()
         epoch_loss += loss.item()
 
     if (epoch + 1) % 10 == 0 or epoch == 0:
         model.eval()
-        test_auc_list = []
+        test_auc_list, test_ap_list = [], []
         with torch.no_grad():
             for data in test_graphs:
                 data = data.to(GNN_CONFIG["device"])
@@ -521,19 +645,25 @@ for epoch in range(GNN_CONFIG["gnn_epochs"]):
                 neg_ei = negative_sampling(
                     test_ei, num_nodes=data.x.size(0),
                     num_neg_samples=test_ei.size(1),
-                )
+                ).to(GNN_CONFIG["device"])
 
-                pos_pred, neg_pred, _, _, _ = model(data, test_ei, neg_ei)
+                num_nodes = data.x.size(0)
+                pos_sf, pos_cn = sf_computer.compute(data.edge_index.cpu(), num_nodes, test_ei.cpu())
+                neg_sf, neg_cn = sf_computer.compute(data.edge_index.cpu(), num_nodes, neg_ei.cpu())
+
+                pos_pred, neg_pred, _, _ = model(data, test_ei, neg_ei, pos_sf, neg_sf, pos_cn, neg_cn)
                 preds = torch.cat([torch.sigmoid(pos_pred), torch.sigmoid(neg_pred)]).cpu().numpy()
                 labels = np.concatenate([np.ones(pos_pred.size(0)), np.zeros(neg_pred.size(0))])
 
                 if len(np.unique(labels)) > 1:
                     test_auc_list.append(roc_auc_score(labels, preds))
+                    test_ap_list.append(average_precision_score(labels, preds))
 
         avg_auc = np.mean(test_auc_list) if test_auc_list else 0.0
+        avg_ap = np.mean(test_ap_list) if test_ap_list else 0.0
         print(
             f"[GNN] Epoch {epoch+1}/{GNN_CONFIG['gnn_epochs']} | "
-            f"Loss: {epoch_loss/max(len(train_graphs),1):.4f} | Test AUC: {avg_auc:.4f}"
+            f"Loss: {epoch_loss/max(len(train_graphs),1):.4f} | Test AUC: {avg_auc:.4f} | AP: {avg_ap:.4f}"
         )
 
 print("GNN training complete")
@@ -555,9 +685,13 @@ with torch.no_grad():
         neg_ei = negative_sampling(
             pos_ei, num_nodes=data.x.size(0),
             num_neg_samples=pos_ei.size(1),
-        )
+        ).to(GNN_CONFIG["device"])
 
-        pos_pred, neg_pred, z, alpha1, alpha2 = model(data, pos_ei, neg_ei, return_attention=True)
+        num_nodes = data.x.size(0)
+        pos_sf, pos_cn = sf_computer.compute(data.edge_index.cpu(), num_nodes, pos_ei.cpu())
+        neg_sf, neg_cn = sf_computer.compute(data.edge_index.cpu(), num_nodes, neg_ei.cpu())
+
+        pos_pred, neg_pred, z, alphas = model(data, pos_ei, neg_ei, pos_sf, neg_sf, pos_cn, neg_cn, return_attention=True)
 
         all_preds_gnn.extend(torch.sigmoid(pos_pred).cpu().numpy().tolist())
         all_labels_gnn.extend([1] * pos_pred.size(0))
@@ -567,7 +701,9 @@ with torch.no_grad():
         if len(sample_traces) < 3:
             all_ei = torch.cat([pos_ei, neg_ei], dim=1)
             all_pred = torch.cat([pos_pred, neg_pred])
-            traces = reasoner.generate(data, z, all_ei, all_pred, alpha1)
+            all_sf = torch.cat([pos_sf, neg_sf], dim=0)
+            all_cn = pos_cn + neg_cn
+            traces = reasoner.generate(data, z, all_ei, all_pred, alphas=alphas, structural_feats=all_sf, cn_indices_list=all_cn)
             sample_traces.append(traces[:5])
 
 all_preds_gnn = np.array(all_preds_gnn)
@@ -620,13 +756,15 @@ with torch.no_grad():
         data = graphs[idx].to(GNN_CONFIG["device"])
         mask_np = masks[idx].numpy()
 
-        z, alpha1, _ = model.encode(data, return_attention=True)
+        z, alphas = model.encode(data, return_attention=True)
 
         pos_ei = data.edge_index
-        edge_preds = model.decode(z, pos_ei)
+        num_nodes = data.x.size(0)
+        pos_sf, pos_cn = sf_computer.compute(data.edge_index.cpu(), num_nodes, pos_ei.cpu())
+        edge_preds = model.decode(z, pos_ei, pos_sf, pos_cn)
         edge_probs = torch.sigmoid(edge_preds)
 
-        traces = reasoner.generate(data, z, pos_ei, edge_preds, alpha1)
+        traces = reasoner.generate(data, z, pos_ei, edge_preds, alphas=alphas, structural_feats=pos_sf, cn_indices_list=pos_cn)
 
         pos_np = data.pos.cpu().numpy()
         probs_np = edge_probs.cpu().numpy()
@@ -664,21 +802,23 @@ with torch.no_grad():
             edge_vmin=0, edge_vmax=1,
             with_labels=True, font_size=7, width=2,
         )
-        axes[1, col].set_title(f"Edge Confidence", fontsize=9)
+        axes[1, col].set_title(f"Edge Confidence (NCN)", fontsize=9)
 
-plt.suptitle("End-to-End: Mask -> Graph -> Edge Prediction", fontsize=14)
+plt.suptitle("End-to-End: Mask -> Graph -> NCN Edge Prediction", fontsize=14)
 plt.tight_layout()
 plt.show()
 
 print("\nSample Reasoning Traces from Demo:")
 demo_data = graphs[demo_indices[0]].to(GNN_CONFIG["device"])
 with torch.no_grad():
-    z, a1, _ = model.encode(demo_data, return_attention=True)
-    ep = model.decode(z, demo_data.edge_index)
-    demo_traces = reasoner.generate(demo_data, z, demo_data.edge_index, ep, a1)
+    z, alphas = model.encode(demo_data, return_attention=True)
+    num_nodes = demo_data.x.size(0)
+    demo_sf, demo_cn = sf_computer.compute(demo_data.edge_index.cpu(), num_nodes, demo_data.edge_index.cpu())
+    ep = model.decode(z, demo_data.edge_index, demo_sf, demo_cn)
+    demo_traces = reasoner.generate(demo_data, z, demo_data.edge_index, ep, alphas=alphas, structural_feats=demo_sf, cn_indices_list=demo_cn)
 
 for t in demo_traces[:5]:
     print(f"\n  {t['reasoning_text']}")
     print(f"    confidence={t['prediction_confidence']}, "
           f"cosine_sim={t['embedding_cosine_similarity']}, "
-          f"area_ratio={t['area_ratio']}")
+          f"cn={t.get('cn_count', 'N/A')}, jaccard={t.get('jaccard', 'N/A')}")

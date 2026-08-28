@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 import torchvision.transforms as T
 from torchvision import models
+from torchvision.models import ConvNeXt_Base_Weights
 from pathlib import Path
 from PIL import Image
 import numpy as np
@@ -22,29 +23,32 @@ import random
 CONFIG = {
     "data_root": Path("Brain MRI ND-5 Dataset/tumordata"),
     "img_size": 224,
-    "batch_size": 32,
+    "batch_size": 16,
     "num_workers": 4,
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "seed": 42,
     "val_split": 0.15,
     "phase1": {
-        "lr": 1e-4,
-        "weight_decay": 1e-5,
-        "epochs": 15,
-        "freeze_epochs": 3,
+        "lr": 5e-5,
+        "weight_decay": 1e-4,
+        "epochs": 20,
+        "freeze_epochs": 4,
+        "accum_steps": 2,
         "checkpoint": "checkpoints/phase1_binary.pth",
     },
     "phase2": {
-        "lr": 1e-4,
-        "weight_decay": 1e-5,
-        "epochs": 15,
-        "freeze_epochs": 3,
+        "lr": 5e-5,
+        "weight_decay": 1e-4,
+        "epochs": 20,
+        "freeze_epochs": 4,
+        "accum_steps": 2,
         "checkpoint": "checkpoints/phase2_multiclass.pth",
     },
     "phase3": {
-        "lr": 1e-4,
-        "weight_decay": 1e-5,
-        "epochs": 20,
+        "lr": 3e-4,
+        "weight_decay": 1e-4,
+        "epochs": 30,
+        "accum_steps": 2,
         "checkpoint": "checkpoints/phase3_unet.pth",
     },
     "class_to_idx": {
@@ -126,12 +130,14 @@ class BrainMRIDataset(Dataset):
 
 
 train_transform = T.Compose([
-    T.Resize((CONFIG["img_size"], CONFIG["img_size"])),
+    T.RandomResizedCrop(CONFIG["img_size"], scale=(0.7, 1.0), ratio=(0.9, 1.1)),
     T.RandomHorizontalFlip(p=0.5),
     T.RandomRotation(degrees=15),
-    T.ColorJitter(brightness=0.2, contrast=0.2),
+    T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+    T.RandAugment(num_ops=2, magnitude=9),
     T.ToTensor(),
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    T.RandomErasing(p=0.25, scale=(0.02, 0.15)),
 ])
 
 val_transform = T.Compose([
@@ -248,22 +254,35 @@ plt.show()
 
 
 def build_binary_classifier():
-    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-    model.classifier[1] = nn.Linear(model.classifier[1].in_features, 1)
-    return model.to(CONFIG["device"])
+    backbone = models.convnext_base(weights=ConvNeXt_Base_Weights.IMAGENET1K_V1)
+    in_features = backbone.classifier[2].in_features
+    backbone.classifier = nn.Sequential(
+        nn.AdaptiveAvgPool2d(1),
+        nn.Flatten(),
+        nn.LayerNorm(in_features),
+        nn.Linear(in_features, 512),
+        nn.GELU(),
+        nn.Dropout(0.3),
+        nn.Linear(512, 1),
+    )
+    return backbone.to(CONFIG["device"])
 
-def train_one_epoch_binary(model, loader, criterion, optimizer):
+def train_one_epoch_binary(model, loader, criterion, optimizer, scheduler, accum_steps=1):
     model.train()
     total_loss, correct, total = 0, 0, 0
-    for imgs, binary_labels, _ in loader:
+    optimizer.zero_grad()
+    for step, (imgs, binary_labels, _) in enumerate(loader):
         imgs = imgs.to(CONFIG["device"])
         labels = binary_labels.float().to(CONFIG["device"])
-        optimizer.zero_grad()
         out = model(imgs).squeeze(1)
-        loss = criterion(out, labels)
+        loss = criterion(out, labels) / accum_steps
         loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * imgs.size(0)
+        if (step + 1) % accum_steps == 0 or (step + 1) == len(loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+        total_loss += loss.item() * accum_steps * imgs.size(0)
         preds = (torch.sigmoid(out) > 0.5).long()
         correct += (preds == labels.long()).sum().item()
         total += imgs.size(0)
@@ -285,7 +304,7 @@ def eval_binary(model, loader, criterion):
     return total_loss / total, correct / total
 
 binary_model = build_binary_classifier()
-criterion_binary = nn.BCEWithLogitsLoss()
+criterion_binary = nn.BCEWithLogitsLoss(label_smoothing=0.05) if hasattr(nn.BCEWithLogitsLoss, 'label_smoothing') else nn.BCEWithLogitsLoss()
 
 for param in binary_model.features.parameters():
     param.requires_grad = False
@@ -295,8 +314,11 @@ optimizer_binary = optim.AdamW(
     lr=CONFIG["phase1"]["lr"],
     weight_decay=CONFIG["phase1"]["weight_decay"],
 )
-scheduler_binary = optim.lr_scheduler.CosineAnnealingLR(
-    optimizer_binary, T_max=CONFIG["phase1"]["epochs"]
+scheduler_binary = optim.lr_scheduler.OneCycleLR(
+    optimizer_binary,
+    max_lr=CONFIG["phase1"]["lr"],
+    steps_per_epoch=(len(train_loader) + CONFIG["phase1"]["accum_steps"] - 1) // CONFIG["phase1"]["accum_steps"],
+    epochs=CONFIG["phase1"]["freeze_epochs"],
 )
 
 best_val_acc = 0.0
@@ -309,16 +331,18 @@ for epoch in range(CONFIG["phase1"]["epochs"]):
             lr=CONFIG["phase1"]["lr"] * 0.1,
             weight_decay=CONFIG["phase1"]["weight_decay"],
         )
-        scheduler_binary = optim.lr_scheduler.CosineAnnealingLR(
+        scheduler_binary = optim.lr_scheduler.OneCycleLR(
             optimizer_binary,
-            T_max=CONFIG["phase1"]["epochs"] - CONFIG["phase1"]["freeze_epochs"],
+            max_lr=CONFIG["phase1"]["lr"] * 0.1,
+            steps_per_epoch=(len(train_loader) + CONFIG["phase1"]["accum_steps"] - 1) // CONFIG["phase1"]["accum_steps"],
+            epochs=CONFIG["phase1"]["epochs"] - CONFIG["phase1"]["freeze_epochs"],
         )
 
     train_loss, train_acc = train_one_epoch_binary(
-        binary_model, train_loader, criterion_binary, optimizer_binary
+        binary_model, train_loader, criterion_binary, optimizer_binary,
+        scheduler_binary, accum_steps=CONFIG["phase1"]["accum_steps"],
     )
     val_loss, val_acc = eval_binary(binary_model, val_loader, criterion_binary)
-    scheduler_binary.step()
 
     print(
         f"[Phase1] Epoch {epoch+1}/{CONFIG['phase1']['epochs']} | "
@@ -400,23 +424,72 @@ tumor_val_loader = DataLoader(
     shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True,
 )
 
-def build_multiclass_classifier():
-    model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-    model.classifier[1] = nn.Linear(model.classifier[1].in_features, 3)
-    return model.to(CONFIG["device"])
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
 
-def train_one_epoch_multi(model, loader, criterion, optimizer):
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction="none")
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        return focal_loss
+
+def build_multiclass_classifier():
+    backbone = models.convnext_base(weights=ConvNeXt_Base_Weights.IMAGENET1K_V1)
+    in_features = backbone.classifier[2].in_features
+    backbone.classifier = nn.Identity()
+    model = nn.Sequential(
+        backbone,
+        nn.AdaptiveAvgPool2d(1) if hasattr(backbone, 'features') else nn.Identity(),
+    )
+
+    class DualPoolConvNeXt(nn.Module):
+        def __init__(self, base, feat_dim):
+            super().__init__()
+            self.features = base.features
+            self.avgpool = nn.AdaptiveAvgPool2d(1)
+            self.maxpool = nn.AdaptiveMaxPool2d(1)
+            self.head = nn.Sequential(
+                nn.LayerNorm(feat_dim * 2),
+                nn.Linear(feat_dim * 2, 512),
+                nn.GELU(),
+                nn.Dropout(0.4),
+                nn.Linear(512, 3),
+            )
+
+        def forward(self, x):
+            x = self.features(x)
+            avg_out = self.avgpool(x).flatten(1)
+            max_out = self.maxpool(x).flatten(1)
+            x = torch.cat([avg_out, max_out], dim=1)
+            return self.head(x)
+
+    dual_model = DualPoolConvNeXt(backbone, in_features)
+    return dual_model.to(CONFIG["device"])
+
+def train_one_epoch_multi(model, loader, criterion, optimizer, scheduler, accum_steps=1):
     model.train()
     total_loss, correct, total = 0, 0, 0
-    for imgs, _, multi_labels in loader:
+    optimizer.zero_grad()
+    for step, (imgs, _, multi_labels) in enumerate(loader):
         imgs = imgs.to(CONFIG["device"])
         labels = multi_labels.to(CONFIG["device"])
-        optimizer.zero_grad()
         out = model(imgs)
-        loss = criterion(out, labels)
+        loss = criterion(out, labels) / accum_steps
         loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * imgs.size(0)
+        if (step + 1) % accum_steps == 0 or (step + 1) == len(loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+        total_loss += loss.item() * accum_steps * imgs.size(0)
         correct += (out.argmax(1) == labels).sum().item()
         total += imgs.size(0)
     return total_loss / total, correct / total
@@ -436,8 +509,9 @@ def eval_multi(model, loader, criterion):
     return total_loss / total, correct / total
 
 multi_model = build_multiclass_classifier()
-criterion_multi = nn.CrossEntropyLoss(
-    weight=tumor_class_weights.to(CONFIG["device"])
+criterion_multi = FocalLoss(
+    alpha=tumor_class_weights.to(CONFIG["device"]),
+    gamma=2.0,
 )
 
 for param in multi_model.features.parameters():
@@ -448,8 +522,11 @@ optimizer_multi = optim.AdamW(
     lr=CONFIG["phase2"]["lr"],
     weight_decay=CONFIG["phase2"]["weight_decay"],
 )
-scheduler_multi = optim.lr_scheduler.CosineAnnealingLR(
-    optimizer_multi, T_max=CONFIG["phase2"]["epochs"]
+scheduler_multi = optim.lr_scheduler.OneCycleLR(
+    optimizer_multi,
+    max_lr=CONFIG["phase2"]["lr"],
+    steps_per_epoch=(len(tumor_train_loader) + CONFIG["phase2"]["accum_steps"] - 1) // CONFIG["phase2"]["accum_steps"],
+    epochs=CONFIG["phase2"]["freeze_epochs"],
 )
 
 best_val_acc_multi = 0.0
@@ -462,16 +539,18 @@ for epoch in range(CONFIG["phase2"]["epochs"]):
             lr=CONFIG["phase2"]["lr"] * 0.1,
             weight_decay=CONFIG["phase2"]["weight_decay"],
         )
-        scheduler_multi = optim.lr_scheduler.CosineAnnealingLR(
+        scheduler_multi = optim.lr_scheduler.OneCycleLR(
             optimizer_multi,
-            T_max=CONFIG["phase2"]["epochs"] - CONFIG["phase2"]["freeze_epochs"],
+            max_lr=CONFIG["phase2"]["lr"] * 0.1,
+            steps_per_epoch=(len(tumor_train_loader) + CONFIG["phase2"]["accum_steps"] - 1) // CONFIG["phase2"]["accum_steps"],
+            epochs=CONFIG["phase2"]["epochs"] - CONFIG["phase2"]["freeze_epochs"],
         )
 
     train_loss, train_acc = train_one_epoch_multi(
-        multi_model, tumor_train_loader, criterion_multi, optimizer_multi
+        multi_model, tumor_train_loader, criterion_multi, optimizer_multi,
+        scheduler_multi, accum_steps=CONFIG["phase2"]["accum_steps"],
     )
     val_loss, val_acc = eval_multi(multi_model, tumor_val_loader, criterion_multi)
-    scheduler_multi.step()
 
     print(
         f"[Phase2] Epoch {epoch+1}/{CONFIG['phase2']['epochs']} | "
@@ -572,7 +651,7 @@ class GradCAM:
 
 multi_model.load_state_dict(torch.load(CONFIG["phase2"]["checkpoint"], weights_only=True))
 multi_model.eval()
-gradcam = GradCAM(multi_model, multi_model.features[-1])
+gradcam = GradCAM(multi_model, multi_model.features[-1][-1])
 
 for cls_name in CONFIG["tumor_classes"]:
     os.makedirs(str(CONFIG["pseudo_mask_dir"] / cls_name), exist_ok=True)
@@ -694,6 +773,25 @@ class DiceLoss(nn.Module):
         intersection = (pred_flat * target_flat).sum()
         return 1 - (2.0 * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
 
+class BoundaryLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+    def get_boundary(self, mask):
+        gx = F.conv2d(mask, self.sobel_x, padding=1)
+        gy = F.conv2d(mask, self.sobel_y, padding=1)
+        return torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
+
+    def forward(self, pred, target):
+        pred_sig = torch.sigmoid(pred)
+        pred_boundary = self.get_boundary(pred_sig)
+        target_boundary = self.get_boundary(target)
+        return F.mse_loss(pred_boundary, target_boundary)
+
 tumor_image_paths = []
 for cls in CONFIG["tumor_classes"]:
     cls_dir = CONFIG["data_root"] / "Training" / cls
@@ -718,8 +816,8 @@ seg_val_loader = DataLoader(
     shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True,
 )
 
-unet = smp.Unet(
-    encoder_name="efficientnet-b0",
+seg_model = smp.DeepLabV3Plus(
+    encoder_name="efficientnet-b4",
     encoder_weights="imagenet",
     in_channels=3,
     classes=1,
@@ -727,13 +825,17 @@ unet = smp.Unet(
 
 bce_loss = nn.BCEWithLogitsLoss()
 dice_loss = DiceLoss()
+boundary_loss = BoundaryLoss().to(CONFIG["device"])
 optimizer_seg = optim.AdamW(
-    unet.parameters(),
+    seg_model.parameters(),
     lr=CONFIG["phase3"]["lr"],
     weight_decay=CONFIG["phase3"]["weight_decay"],
 )
-scheduler_seg = optim.lr_scheduler.CosineAnnealingLR(
-    optimizer_seg, T_max=CONFIG["phase3"]["epochs"]
+scheduler_seg = optim.lr_scheduler.OneCycleLR(
+    optimizer_seg,
+    max_lr=CONFIG["phase3"]["lr"],
+    steps_per_epoch=(len(seg_train_loader) + CONFIG["phase3"]["accum_steps"] - 1) // CONFIG["phase3"]["accum_steps"],
+    epochs=CONFIG["phase3"]["epochs"],
 )
 
 def dice_score(pred, target, threshold=0.5):
@@ -742,32 +844,36 @@ def dice_score(pred, target, threshold=0.5):
     return (2.0 * intersection) / (pred_bin.sum() + target.sum() + 1e-8)
 
 best_dice = 0.0
+accum_steps_seg = CONFIG["phase3"]["accum_steps"]
 for epoch in range(CONFIG["phase3"]["epochs"]):
-    unet.train()
+    seg_model.train()
     epoch_loss = 0.0
-    for imgs, masks in seg_train_loader:
+    optimizer_seg.zero_grad()
+    for step, (imgs, masks) in enumerate(seg_train_loader):
         imgs = imgs.to(CONFIG["device"])
         masks = masks.to(CONFIG["device"])
-        optimizer_seg.zero_grad()
-        out = unet(imgs)
-        loss = 0.5 * bce_loss(out, masks) + 0.5 * dice_loss(out, masks)
+        out = seg_model(imgs)
+        loss = (0.4 * bce_loss(out, masks) + 0.4 * dice_loss(out, masks) + 0.2 * boundary_loss(out, masks)) / accum_steps_seg
         loss.backward()
-        optimizer_seg.step()
-        epoch_loss += loss.item() * imgs.size(0)
+        if (step + 1) % accum_steps_seg == 0 or (step + 1) == len(seg_train_loader):
+            torch.nn.utils.clip_grad_norm_(seg_model.parameters(), max_norm=1.0)
+            optimizer_seg.step()
+            scheduler_seg.step()
+            optimizer_seg.zero_grad()
+        epoch_loss += loss.item() * accum_steps_seg * imgs.size(0)
 
-    unet.eval()
+    seg_model.eval()
     val_dice_total = 0.0
     val_count = 0
     with torch.no_grad():
         for imgs, masks in seg_val_loader:
             imgs = imgs.to(CONFIG["device"])
             masks = masks.to(CONFIG["device"])
-            out = unet(imgs)
+            out = seg_model(imgs)
             val_dice_total += dice_score(out, masks).item() * imgs.size(0)
             val_count += imgs.size(0)
 
     avg_dice = val_dice_total / val_count
-    scheduler_seg.step()
 
     print(
         f"[Phase3] Epoch {epoch+1}/{CONFIG['phase3']['epochs']} | "
@@ -776,14 +882,21 @@ for epoch in range(CONFIG["phase3"]["epochs"]):
 
     if avg_dice > best_dice:
         best_dice = avg_dice
-        torch.save(unet.state_dict(), CONFIG["phase3"]["checkpoint"])
+        torch.save(seg_model.state_dict(), CONFIG["phase3"]["checkpoint"])
 
 print(f"Best Phase3 Val Dice: {best_dice:.4f}")
 
 
 
-unet.load_state_dict(torch.load(CONFIG["phase3"]["checkpoint"], weights_only=True))
-unet.eval()
+seg_model.load_state_dict(torch.load(CONFIG["phase3"]["checkpoint"], weights_only=True))
+seg_model.eval()
+
+def tta_predict(model, imgs):
+    with torch.no_grad():
+        out1 = torch.sigmoid(model(imgs))
+        out2 = torch.sigmoid(model(torch.flip(imgs, dims=[3])))
+        out2 = torch.flip(out2, dims=[3])
+        return (out1 + out2) / 2.0
 
 tumor_test_paths = []
 for cls in CONFIG["tumor_classes"]:
@@ -802,8 +915,7 @@ if len(test_seg_dataset) == 0:
         img, _, _ = no_aug_test[idx]
         sample_test_imgs.append(img)
     sample_test_imgs = torch.stack(sample_test_imgs).to(CONFIG["device"])
-    with torch.no_grad():
-        pred_masks = torch.sigmoid(unet(sample_test_imgs)).cpu()
+    pred_masks = tta_predict(seg_model, sample_test_imgs).cpu()
 
     fig, axes = plt.subplots(4, 6, figsize=(18, 12))
     for i in range(min(4, len(sample_test_imgs))):
@@ -816,7 +928,7 @@ if len(test_seg_dataset) == 0:
             axes[i, j * 3].set_title("Image", fontsize=8)
             axes[i, j * 3].axis("off")
             axes[i, j * 3 + 1].imshow(pred_masks[idx, 0], cmap="gray")
-            axes[i, j * 3 + 1].set_title("Pred Mask", fontsize=8)
+            axes[i, j * 3 + 1].set_title("Pred Mask (TTA)", fontsize=8)
             axes[i, j * 3 + 1].axis("off")
             overlay = img_viz.copy()
             mask_np = pred_masks[idx, 0].numpy()
@@ -824,7 +936,7 @@ if len(test_seg_dataset) == 0:
             axes[i, j * 3 + 2].imshow(overlay)
             axes[i, j * 3 + 2].set_title("Overlay", fontsize=8)
             axes[i, j * 3 + 2].axis("off")
-    plt.suptitle("Phase 3: Segmentation on Test Images", fontsize=14)
+    plt.suptitle("Phase 3: DeepLabV3+ Segmentation on Test Images (TTA)", fontsize=14)
     plt.tight_layout()
     plt.show()
 else:
@@ -835,8 +947,8 @@ else:
         for imgs, masks in test_seg_loader:
             imgs = imgs.to(CONFIG["device"])
             masks = masks.to(CONFIG["device"])
-            out = unet(imgs)
-            pred = (torch.sigmoid(out) > 0.5).float()
+            pred_probs = tta_predict(seg_model, imgs)
+            pred = (pred_probs > 0.5).float()
             for k in range(imgs.size(0)):
                 inter = (pred[k] * masks[k]).sum()
                 union = pred[k].sum() + masks[k].sum() - inter
@@ -850,8 +962,8 @@ else:
                     sample_gt_viz.append(masks[k, 0].cpu().numpy())
                     sample_pred_viz.append(pred[k, 0].cpu().numpy())
 
-    print(f"Test Dice: {total_dice/count:.4f}")
-    print(f"Test IoU:  {total_iou/count:.4f}")
+    print(f"Test Dice (TTA): {total_dice/count:.4f}")
+    print(f"Test IoU (TTA):  {total_iou/count:.4f}")
 
     fig, axes = plt.subplots(4, 6, figsize=(18, 12))
     for i in range(min(4, len(sample_imgs_viz))):
@@ -866,9 +978,9 @@ else:
             axes[i, j*3+1].set_title("GT Mask", fontsize=8)
             axes[i, j*3+1].axis("off")
             axes[i, j*3+2].imshow(sample_pred_viz[idx], cmap="gray")
-            axes[i, j*3+2].set_title("Pred Mask", fontsize=8)
+            axes[i, j*3+2].set_title("Pred (TTA)", fontsize=8)
             axes[i, j*3+2].axis("off")
-    plt.suptitle("Phase 3: Segmentation Evaluation", fontsize=14)
+    plt.suptitle("Phase 3: DeepLabV3+ Segmentation Evaluation (TTA)", fontsize=14)
     plt.tight_layout()
     plt.show()
 
@@ -878,8 +990,8 @@ binary_model.load_state_dict(torch.load(CONFIG["phase1"]["checkpoint"], weights_
 binary_model.eval()
 multi_model.load_state_dict(torch.load(CONFIG["phase2"]["checkpoint"], weights_only=True))
 multi_model.eval()
-unet.load_state_dict(torch.load(CONFIG["phase3"]["checkpoint"], weights_only=True))
-unet.eval()
+seg_model.load_state_dict(torch.load(CONFIG["phase3"]["checkpoint"], weights_only=True))
+seg_model.eval()
 
 def run_pipeline(img_path):
     img = Image.open(img_path)
@@ -916,8 +1028,8 @@ def run_pipeline(img_path):
             result["tumor_type"] = CONFIG["idx_to_class"][pred_type]
             result["type_confidence"] = type_probs[pred_type].item()
 
-            seg_out = unet(img_tensor)
-            mask = (torch.sigmoid(seg_out) > 0.5).float().squeeze().cpu()
+            seg_mask = tta_predict(seg_model, img_tensor).squeeze().cpu()
+            mask = (seg_mask > 0.5).float()
             result["segmentation_mask"] = mask
 
     return result
@@ -1000,8 +1112,8 @@ with torch.no_grad():
         pred_types = type_probs.argmax(1)
         pred_confs = type_probs.max(1).values
 
-        seg_out = unet(imgs_gpu)
-        masks = (torch.sigmoid(seg_out) > 0.5).float().squeeze(1).cpu()
+        seg_masks = tta_predict(seg_model, imgs_gpu)
+        masks = (seg_masks > 0.5).float().squeeze(1).cpu()
 
         for i in range(imgs.size(0)):
             global_idx = batch_idx * 16 + i

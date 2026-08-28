@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
-import torchvision
 import torchvision.transforms as T
 from torchvision import models
 from pathlib import Path
@@ -76,7 +75,6 @@ os.makedirs(str(CONFIG["pseudo_mask_dir"]), exist_ok=True)
 os.makedirs(str(CONFIG["pipeline_output_dir"]), exist_ok=True)
 
 print(f"Device: {CONFIG['device']}")
-
 
 class BrainMRIDataset(Dataset):
     def __init__(self, root_dir, transform=None):

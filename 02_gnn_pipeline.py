@@ -4,9 +4,17 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 import cv2
-import os
 import random
 from pathlib import Path
+from sklearn.metrics import confusion_matrix
+from torch_geometric.data import Data, Batch
+from torch_geometric.nn import GATConv, BatchNorm, knn_graph
+from torch_geometric.utils import negative_sampling, to_undirected
+from torch_geometric.loader import DataLoader as PyGDataLoader
+from sklearn.metrics import roc_auc_score, average_precision_score
+import networkx as nx
+import torch.optim as optim
+
 
 GNN_CONFIG = {
     "pipeline_output_dir": Path("pipeline_outputs"),
@@ -30,15 +38,6 @@ np.random.seed(GNN_CONFIG["seed"])
 random.seed(GNN_CONFIG["seed"])
 
 print(f"Device: {GNN_CONFIG['device']}")
-
-
-
-from torch_geometric.data import Data, Batch
-from torch_geometric.nn import GATConv, BatchNorm, knn_graph
-from torch_geometric.utils import negative_sampling, to_undirected
-from torch_geometric.loader import DataLoader as PyGDataLoader
-from sklearn.metrics import roc_auc_score, average_precision_score
-import networkx as nx
 
 metadata_path = GNN_CONFIG["pipeline_output_dir"] / "metadata.pt"
 
@@ -432,11 +431,8 @@ class ReasoningTraceGenerator:
 reasoner = ReasoningTraceGenerator(idx_to_class)
 print("ReasoningTraceGenerator initialized")
 
-
-
 def prepare_edge_split(data, train_ratio=0.8):
     edge_index = data.edge_index
-    num_edges = edge_index.size(1) // 2
 
     undirected_edges = []
     seen = set()

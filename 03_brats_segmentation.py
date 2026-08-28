@@ -76,7 +76,11 @@ def zscore_normalize(volume):
     return volume
 
 
-def extract_tumor_slices(case, config):
+slice_cache_dir = BRATS_CONFIG["output_dir"] / "slice_cache"
+slice_cache_dir.mkdir(parents=True, exist_ok=True)
+
+
+def extract_and_save_slices(case, config, cache_dir):
     seg_vol = load_volume(case["files"]["seg"])
     modality_vols = {}
     for mod in config["modalities"]:
@@ -84,7 +88,7 @@ def extract_tumor_slices(case, config):
         vol = zscore_normalize(vol)
         modality_vols[mod] = vol
 
-    slices = []
+    saved = []
     num_axial = seg_vol.shape[2]
 
     for s in range(num_axial):
@@ -104,43 +108,51 @@ def extract_tumor_slices(case, config):
         seg_resized = cv2.resize(seg_slice, (config["img_size"], config["img_size"]),
                                  interpolation=cv2.INTER_NEAREST)
 
-        img_4ch = np.stack(img_channels, axis=0)
+        img_4ch = np.stack(img_channels, axis=0).astype(np.float32)
+        mask = seg_resized.astype(np.int64)
 
-        slices.append({
-            "image": img_4ch,
-            "mask": seg_resized.astype(np.int64),
+        fname = f"{case['case_id']}_s{s:03d}"
+        img_path = cache_dir / f"{fname}_img.npy"
+        mask_path = cache_dir / f"{fname}_mask.npy"
+        np.save(str(img_path), img_4ch)
+        np.save(str(mask_path), mask)
+
+        saved.append({
+            "img_path": str(img_path),
+            "mask_path": str(mask_path),
             "case_id": case["case_id"],
             "slice_idx": s,
         })
 
-    return slices
+    del modality_vols, seg_vol
+    return saved
 
 
-print("Extracting 2D slices from all volumes...")
-all_slices = []
-case_ids_per_slice = []
+print("Extracting 2D slices to disk...")
+all_slice_meta = []
 
 for i, case in enumerate(cases):
-    case_slices = extract_tumor_slices(case, BRATS_CONFIG)
-    all_slices.extend(case_slices)
-    case_ids_per_slice.extend([case["case_id"]] * len(case_slices))
+    case_meta = extract_and_save_slices(case, BRATS_CONFIG, slice_cache_dir)
+    all_slice_meta.extend(case_meta)
 
     if (i + 1) % 50 == 0 or i == 0 or i == len(cases) - 1:
-        print(f"  Processed {i+1}/{len(cases)} cases | Total slices so far: {len(all_slices)}")
+        print(f"  Processed {i+1}/{len(cases)} cases | Total slices so far: {len(all_slice_meta)}")
 
-print(f"\nTotal slices extracted: {len(all_slices)}")
+print(f"\nTotal slices extracted: {len(all_slice_meta)}")
 
 label_counts = {0: 0, 1: 0, 2: 0, 3: 0}
-for s in all_slices:
+for i in range(0, len(all_slice_meta), max(len(all_slice_meta) // 200, 1)):
+    mask = np.load(all_slice_meta[i]["mask_path"])
     for lbl in range(4):
-        label_counts[lbl] += (s["mask"] == lbl).sum()
+        label_counts[lbl] += (mask == lbl).sum()
 total_px = sum(label_counts.values())
-print("Label distribution (pixels):")
+print("Label distribution (sampled, pixels):")
 for lbl, count in label_counts.items():
     name = BRATS_CONFIG["class_names"][lbl]
     print(f"  {lbl} ({name}): {count:,} ({100*count/total_px:.1f}%)")
 
 
+case_ids_per_slice = [s["case_id"] for s in all_slice_meta]
 unique_case_ids = sorted(set(case_ids_per_slice))
 train_cases, temp_cases = train_test_split(
     unique_case_ids,
@@ -157,28 +169,28 @@ train_cases_set = set(train_cases)
 val_cases_set = set(val_cases)
 test_cases_set = set(test_cases)
 
-train_slices = [s for s in all_slices if s["case_id"] in train_cases_set]
-val_slices = [s for s in all_slices if s["case_id"] in val_cases_set]
-test_slices = [s for s in all_slices if s["case_id"] in test_cases_set]
+train_meta = [s for s in all_slice_meta if s["case_id"] in train_cases_set]
+val_meta = [s for s in all_slice_meta if s["case_id"] in val_cases_set]
+test_meta = [s for s in all_slice_meta if s["case_id"] in test_cases_set]
 
 print(f"\nPatient-level split:")
-print(f"  Train: {len(train_cases)} patients, {len(train_slices)} slices")
-print(f"  Val:   {len(val_cases)} patients, {len(val_slices)} slices")
-print(f"  Test:  {len(test_cases)} patients, {len(test_slices)} slices")
+print(f"  Train: {len(train_cases)} patients, {len(train_meta)} slices")
+print(f"  Val:   {len(val_cases)} patients, {len(val_meta)} slices")
+print(f"  Test:  {len(test_cases)} patients, {len(test_meta)} slices")
 
 
 class BraTSSliceDataset(Dataset):
-    def __init__(self, slices_list, augment=False):
-        self.slices = slices_list
+    def __init__(self, slice_meta_list, augment=False):
+        self.meta = slice_meta_list
         self.augment = augment
 
     def __len__(self):
-        return len(self.slices)
+        return len(self.meta)
 
     def __getitem__(self, idx):
-        s = self.slices[idx]
-        image = s["image"].copy()
-        mask = s["mask"].copy()
+        m = self.meta[idx]
+        image = np.load(m["img_path"]).copy()
+        mask = np.load(m["mask_path"]).copy()
 
         if self.augment:
             if random.random() > 0.5:
@@ -195,9 +207,9 @@ class BraTSSliceDataset(Dataset):
         return torch.from_numpy(image).float(), torch.from_numpy(mask).long()
 
 
-train_dataset = BraTSSliceDataset(train_slices, augment=True)
-val_dataset = BraTSSliceDataset(val_slices, augment=False)
-test_dataset = BraTSSliceDataset(test_slices, augment=False)
+train_dataset = BraTSSliceDataset(train_meta, augment=True)
+val_dataset = BraTSSliceDataset(val_meta, augment=False)
+test_dataset = BraTSSliceDataset(test_meta, augment=False)
 
 train_loader = DataLoader(train_dataset, batch_size=BRATS_CONFIG["batch_size"], shuffle=True, num_workers=2, pin_memory=True)
 val_loader = DataLoader(val_dataset, batch_size=BRATS_CONFIG["batch_size"], shuffle=False, num_workers=2, pin_memory=True)
@@ -210,15 +222,16 @@ print(f"  Test:  {len(test_loader)} batches")
 
 
 fig, axes = plt.subplots(3, 6, figsize=(24, 12))
-sample_indices = random.sample(range(len(train_slices)), min(6, len(train_slices)))
+sample_indices = random.sample(range(len(train_meta)), min(6, len(train_meta)))
 
 for col, idx in enumerate(sample_indices):
-    s = train_slices[idx]
-    t1c = s["image"][1]
-    mask = s["mask"]
+    m = train_meta[idx]
+    img = np.load(m["img_path"])
+    mask = np.load(m["mask_path"])
+    t1c = img[1]
 
     axes[0, col].imshow(t1c, cmap="gray")
-    axes[0, col].set_title(f"T1c | {s['case_id'][-7:]}\nslice {s['slice_idx']}", fontsize=8)
+    axes[0, col].set_title(f"T1c | {m['case_id'][-7:]}\nslice {m['slice_idx']}", fontsize=8)
     axes[0, col].axis("off")
 
     color_mask = np.zeros((*mask.shape, 3), dtype=np.float32)
@@ -493,13 +506,13 @@ fig, axes = plt.subplots(3, 6, figsize=(24, 12))
 viz_indices = random.sample(range(len(all_preds)), min(6, len(all_preds)))
 
 for col, idx in enumerate(viz_indices):
-    s = test_slices[idx]
-    t1c = s["image"][1]
+    m = test_meta[idx]
+    t1c = np.load(m["img_path"])[1]
     gt = all_gts[idx]
     pred = all_preds[idx]
 
     axes[0, col].imshow(t1c, cmap="gray")
-    axes[0, col].set_title(f"T1c | {s['case_id'][-7:]}", fontsize=8)
+    axes[0, col].set_title(f"T1c | {m['case_id'][-7:]}", fontsize=8)
     axes[0, col].axis("off")
 
     gt_color = np.zeros((*gt.shape, 3), dtype=np.float32)
@@ -550,22 +563,24 @@ export_metadata = {
 }
 
 model.eval()
-all_export_slices = [
-    ("train", train_slices),
-    ("val", val_slices),
-    ("test", test_slices),
+all_export_meta = [
+    ("train", train_meta),
+    ("val", val_meta),
+    ("test", test_meta),
 ]
 
 export_count = 0
 with torch.no_grad():
-    for split_name, split_slices in all_export_slices:
-        for i, s in enumerate(split_slices):
-            image = torch.from_numpy(s["image"]).unsqueeze(0).float().to(BRATS_CONFIG["device"])
+    for split_name, split_meta in all_export_meta:
+        for i, m in enumerate(split_meta):
+            img = np.load(m["img_path"])
+            gt_mask = np.load(m["mask_path"])
+            image = torch.from_numpy(img).unsqueeze(0).float().to(BRATS_CONFIG["device"])
             logits = model(image)
             pred = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
 
-            case_id = s["case_id"]
-            slice_idx = s["slice_idx"]
+            case_id = m["case_id"]
+            slice_idx = m["slice_idx"]
             fname = f"{case_id}_s{slice_idx:03d}"
 
             mask_path = masks_dir / f"{fname}_pred.npy"
@@ -573,8 +588,8 @@ with torch.no_grad():
             gt_path = gt_dir / f"{fname}_gt.npy"
 
             np.save(str(mask_path), pred)
-            np.save(str(raw_path), s["image"])
-            np.save(str(gt_path), s["mask"].astype(np.uint8))
+            np.save(str(raw_path), img)
+            np.save(str(gt_path), gt_mask.astype(np.uint8))
 
             export_metadata["case_ids"].append(case_id)
             export_metadata["slice_indices"].append(slice_idx)
@@ -584,7 +599,7 @@ with torch.no_grad():
             export_metadata["splits"].append(split_name)
             export_count += 1
 
-        print(f"  Exported {split_name}: {len(split_slices)} slices")
+        print(f"  Exported {split_name}: {len(split_meta)} slices")
 
 torch.save(export_metadata, str(BRATS_CONFIG["output_dir"] / "metadata.pt"))
 

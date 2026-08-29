@@ -1,7 +1,10 @@
 """
-Phase 4: 3D GNN Edge Prediction + Reasoning Traces
-NCN (Neural Common Neighbor) architecture with tissue-aware decoder.
-Input: brats_outputs/ from segmentation pipeline (predicted masks + raw MRI slices)
+Phase 4: Hierarchical Supervoxel-Segmentation GNN
+NCN (Neural Common Neighbor) architecture with:
+  - SVGFormer-inspired supervoxel intra-node aggregation
+  - OCN-enhanced structural features
+  - Tissue-aware edge decoder
+Input: brats_outputs/ (3D volumes + predicted masks from segmentation pipeline)
 """
 
 import torch
@@ -20,7 +23,8 @@ from torch_geometric.nn import knn_graph, GATv2Conv, LayerNorm
 from torch_geometric.utils import negative_sampling
 from sklearn.metrics import roc_auc_score, average_precision_score
 
-from config import SHARED, GNN
+from config import SHARED, GNN, SUPERVOXEL
+from supervoxel import process_case_supervoxels
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -248,6 +252,234 @@ def build_3d_graph(case_id, slice_list, config=None):
     return data
 
 
+# ── Hierarchical Graph Construction (SVGFormer-inspired) ─────────────
+
+class IntraNodeAggregator(nn.Module):
+    """Aggregate supervoxel features within each segmentation node.
+
+    For each seg node:
+      1. Collect SV features of contained supervoxels (K_i × sv_feat_dim)
+      2. Prepend a learnable [CLS] token
+      3. 2-layer Transformer encoder over the set
+      4. Output = [CLS] embedding (64-dim) + attention weights for explanation
+    """
+
+    def __init__(self, sv_feat_dim=None, embed_dim=None, n_heads=4, n_layers=2, dropout=0.1):
+        super().__init__()
+        sv_feat_dim = sv_feat_dim or SUPERVOXEL["sv_feat_dim"]
+        embed_dim = embed_dim or GNN["embed_dim"]
+
+        self.input_proj = nn.Linear(sv_feat_dim, embed_dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_heads,
+            dim_feedforward=embed_dim * 2, dropout=dropout,
+            batch_first=True, activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.embed_dim = embed_dim
+
+    def forward(self, sv_features_list, device=None):
+        """Aggregate SV features for all seg nodes in a graph.
+
+        Args:
+            sv_features_list: list of (K_i, sv_feat_dim) tensors, one per seg node.
+                              K_i can vary per node.
+            device: target device.
+
+        Returns:
+            node_embeds: (N_seg, embed_dim) tensor.
+            sv_attentions: list of (K_i,) tensors — attention weights for explanation.
+        """
+        device = device or SHARED["device"]
+        n_nodes = len(sv_features_list)
+
+        if n_nodes == 0:
+            return torch.zeros(0, self.embed_dim, device=device), []
+
+        # Handle nodes with no SVs (fallback to zero embedding)
+        sv_attentions = []
+        node_embeds = []
+
+        for node_idx in range(n_nodes):
+            sv_feats = sv_features_list[node_idx]  # (K_i, sv_feat_dim)
+
+            if sv_feats is None or sv_feats.size(0) == 0:
+                node_embeds.append(torch.zeros(self.embed_dim, device=device))
+                sv_attentions.append(torch.zeros(0, device=device))
+                continue
+
+            sv_feats = sv_feats.to(device)
+            projected = self.input_proj(sv_feats)  # (K_i, embed_dim)
+
+            # Prepend [CLS] token
+            cls = self.cls_token.expand(1, -1, -1).squeeze(0).to(device)  # (1, embed_dim)
+            seq = torch.cat([cls, projected], dim=0).unsqueeze(0)  # (1, K_i+1, embed_dim)
+
+            # Transformer
+            out = self.transformer(seq)  # (1, K_i+1, embed_dim)
+            cls_out = out[0, 0]  # (embed_dim,) — [CLS] output
+            node_embeds.append(self.out_proj(cls_out))
+
+            # Compute attention weights: dot product of [CLS] with each SV
+            sv_out = out[0, 1:]  # (K_i, embed_dim)
+            attn = torch.matmul(sv_out, cls_out)  # (K_i,)
+            attn = F.softmax(attn, dim=0)
+            sv_attentions.append(attn.detach())
+
+        node_embeds = torch.stack(node_embeds, dim=0)  # (N_seg, embed_dim)
+        return node_embeds, sv_attentions
+
+
+def build_hierarchical_graph(case_id, raw_4ch_3d, seg_mask_3d, config=None):
+    """Build a hierarchical graph: seg nodes with SV internal structure.
+
+    1. Run supervoxel pipeline (3D SLIC + pruning + assignment)
+    2. For each seg component → collect contained SV features (with relative PE)
+    3. Build inter-node edges (KNN + tissue compatibility, same as build_3d_graph)
+    4. Return Data with SV features per node for IntraNodeAggregator
+
+    Args:
+        case_id: patient identifier string.
+        raw_4ch_3d: (4, H, W, D) float32 numpy array.
+        seg_mask_3d: (H, W, D) int numpy array (0=BG, 1=NCR, 2=ED, 3=ET).
+        config: optional config override.
+
+    Returns:
+        Data object with fields:
+          - x: placeholder (N_seg, sv_feat_dim) — mean SV features per node
+          - edge_index, edge_attr, pos, tissue_labels, slice_ids: as before
+          - sv_features: list of (K_i, 25) tensors per node
+          - sv_edge_indices: list of (2, E_i) tensors per node
+          - n_svs_per_node: list of int
+    """
+    config = config or GNN
+    sv_config = SUPERVOXEL
+
+    # Step 1: supervoxel pipeline
+    sv_result = process_case_supervoxels(case_id, raw_4ch_3d, seg_mask_3d, sv_config)
+    components = sv_result["components"]
+
+    if len(components) < 2:
+        empty_dim = sv_config["sv_feat_dim"]
+        return Data(
+            x=torch.zeros(max(len(components), 1), empty_dim),
+            edge_index=torch.zeros(2, 0, dtype=torch.long),
+            pos=torch.tensor([[0.5, 0.5, 0.5]]),
+            edge_attr=torch.zeros(0, config["edge_attr_dim"]),
+            sv_features=[],
+            sv_edge_indices=[],
+            n_svs_per_node=[],
+        )
+
+    n_nodes = len(components)
+    H, W, D = seg_mask_3d.shape
+
+    # Step 2: assemble per-node data
+    sv_features_list = []
+    sv_edge_indices_list = []
+    n_svs_list = []
+    positions = []
+    tissue_labels = []
+    # Use mean z-coordinate of each component as "slice_id"
+    slice_ids_list = []
+
+    for comp in components:
+        comp_id = comp["id"]
+        positions.append(comp["centroid"])
+        tissue_labels.append(comp["tissue_label"])
+
+        # Mean z of component voxels as slice id proxy
+        coords = np.argwhere(comp["mask"])
+        mean_z = float(coords[:, 2].mean()) if len(coords) > 0 else 0.0
+        slice_ids_list.append(int(mean_z))
+
+        # SV features for this component
+        if comp_id in sv_result["sv_features_per_comp"]:
+            sv_feats = sv_result["sv_features_per_comp"][comp_id]
+            sv_features_list.append(sv_feats)
+            n_svs_list.append(sv_feats.size(0))
+        else:
+            sv_features_list.append(torch.zeros(0, sv_config["sv_feat_dim"]))
+            n_svs_list.append(0)
+
+        # Intra-SV edges
+        if comp_id in sv_result["sv_edges_per_comp"]:
+            sv_edge_indices_list.append(sv_result["sv_edges_per_comp"][comp_id])
+        else:
+            sv_edge_indices_list.append(torch.zeros(2, 0, dtype=torch.long))
+
+    # Placeholder x: mean of SV features per node (for compatibility)
+    x_list = []
+    for sv_f in sv_features_list:
+        if sv_f.size(0) > 0:
+            x_list.append(sv_f.mean(dim=0))
+        else:
+            x_list.append(torch.zeros(sv_config["sv_feat_dim"]))
+    x = torch.stack(x_list, dim=0)
+
+    pos_3d = torch.tensor(np.stack(positions), dtype=torch.float32)
+    tissue_labels_t = torch.tensor(tissue_labels, dtype=torch.long)
+    slice_ids_t = torch.tensor(slice_ids_list, dtype=torch.long)
+
+    # Step 3: inter-node edges (same logic as build_3d_graph)
+    # Intra-"slice" edges via KNN on all nodes
+    all_src, all_dst = [], []
+    if n_nodes >= 2:
+        k = min(config["k_neighbors"], n_nodes - 1)
+        if k >= 1:
+            ei = knn_graph(pos_3d, k=k, loop=False)
+            all_src.extend(ei[0].tolist())
+            all_dst.extend(ei[1].tolist())
+
+    # Tissue-compatible edges for nearby nodes
+    for ni in range(n_nodes):
+        for nj in range(ni + 1, n_nodes):
+            dist = float(torch.norm(pos_3d[ni] - pos_3d[nj]))
+            if dist > 0.3:  # normalized distance threshold
+                continue
+            ti = tissue_labels[ni]
+            tj = tissue_labels[nj]
+            compatible = (ti == tj) or (abs(ti - tj) <= 1) or ({ti, tj} == {1, 3})
+            if compatible:
+                all_src.extend([ni, nj])
+                all_dst.extend([nj, ni])
+
+    if len(all_src) == 0:
+        edge_index = torch.zeros(2, 0, dtype=torch.long)
+        edge_attr = torch.zeros(0, config["edge_attr_dim"])
+    else:
+        edge_index = torch.tensor([all_src, all_dst], dtype=torch.long)
+        edge_index = to_undirected(edge_index)
+
+        edge_attr = []
+        for e in range(edge_index.size(1)):
+            si = edge_index[0, e].item()
+            di = edge_index[1, e].item()
+            diff = pos_3d[di] - pos_3d[si]
+            dist = float(torch.norm(diff))
+            angle = float(np.arctan2(diff[1].item(), diff[0].item()))
+            z_gap = abs(slice_ids_list[si] - slice_ids_list[di]) / max(D, 1)
+            same_tissue = 1.0 if tissue_labels[si] == tissue_labels[di] else 0.0
+            edge_attr.append([dist, angle / np.pi, z_gap, same_tissue])
+        edge_attr = torch.tensor(edge_attr, dtype=torch.float32)
+
+    data = Data(
+        x=x,
+        edge_index=edge_index,
+        pos=pos_3d,
+        edge_attr=edge_attr,
+        tissue_labels=tissue_labels_t,
+        slice_ids=slice_ids_t,
+        sv_features=sv_features_list,
+        sv_edge_indices=sv_edge_indices_list,
+        n_svs_per_node=n_svs_list,
+    )
+    return data
+
+
 def load_metadata(config=None):
     """Load brats_outputs metadata and organize by patient."""
     config = config or GNN
@@ -271,17 +503,39 @@ def load_metadata(config=None):
     return patient_slices, metadata
 
 
-def build_all_graphs(config=None):
-    """Build 3D graphs for all patients and split into train/val/test."""
+def build_all_graphs(config=None, use_hierarchy=True):
+    """Build graphs for all patients and split into train/val/test.
+
+    If use_hierarchy=True, loads 3D volumes and builds hierarchical graphs
+    with supervoxel internal structure. Otherwise falls back to the original
+    slice-based build_3d_graph.
+    """
     config = config or GNN
     patient_slices, metadata = load_metadata(config)
 
     print(f"Loaded {len(metadata['case_ids'])} slices from {len(patient_slices)} patients")
 
-    print("Building 3D volumetric graphs...")
+    vol_dir = config["brats_output_dir"] / "volumes"
+
+    print("Building hierarchical volumetric graphs..." if use_hierarchy else "Building 3D graphs...")
     graphs, splits = [], []
+
     for case_id, slice_list in patient_slices.items():
-        g = build_3d_graph(case_id, slice_list, config)
+        if use_hierarchy and vol_dir.exists():
+            raw_path = vol_dir / f"{case_id}_raw4ch.npy"
+            seg_path = vol_dir / f"{case_id}_seg.npy"
+
+            if raw_path.exists() and seg_path.exists():
+                raw_4ch = np.load(str(raw_path))
+                seg_mask = np.load(str(seg_path))
+                g = build_hierarchical_graph(case_id, raw_4ch, seg_mask, config)
+                del raw_4ch, seg_mask  # free memory immediately
+            else:
+                # Fallback to slice-based if 3D volumes missing for this case
+                g = build_3d_graph(case_id, slice_list, config)
+        else:
+            g = build_3d_graph(case_id, slice_list, config)
+
         g.case_id = case_id
         graphs.append(g)
         splits.append(slice_list[0]["split"])
@@ -291,6 +545,11 @@ def build_all_graphs(config=None):
     edge_counts = [g.edge_index.size(1) for g in graphs]
     print(f"  Nodes: min={min(node_counts)}, max={max(node_counts)}, mean={np.mean(node_counts):.1f}")
     print(f"  Edges: min={min(edge_counts)}, max={max(edge_counts)}, mean={np.mean(edge_counts):.1f}")
+
+    # Report SV stats if hierarchical
+    sv_counts = [sum(g.n_svs_per_node) for g in graphs if hasattr(g, 'n_svs_per_node') and g.n_svs_per_node]
+    if sv_counts:
+        print(f"  SVs/graph: min={min(sv_counts)}, max={max(sv_counts)}, mean={np.mean(sv_counts):.1f}")
 
     train_graphs = [g for g, s in zip(graphs, splits) if s == "train"]
     val_graphs = [g for g, s in zip(graphs, splits) if s == "val"]
@@ -307,9 +566,22 @@ def build_all_graphs(config=None):
 # ── Structural Features ──────────────────────────────────────────────
 
 class StructuralFeatureComputer:
-    """Compute CN count, Jaccard, Adamic-Adar for candidate edges."""
+    """OCN-enhanced structural features: CN, Jaccard, AA + orthogonalized residual + path normalization.
 
-    def compute(self, edge_index, num_nodes, candidate_edges, tissue_labels=None, slice_ids=None):
+    Inter-node (5-dim per edge):
+      [cn_count, jaccard, adamic_adar, ocn_residual_norm, path_norm_cn]
+
+    Intra-node topology (4-dim per node):
+      [cn_density, connectivity_ratio, cn_variance, spectral_gap]
+    """
+
+    def compute(self, edge_index, num_nodes, candidate_edges,
+                node_embeddings=None, tissue_labels=None, slice_ids=None):
+        """Compute OCN-enhanced structural features for candidate edges.
+
+        If node_embeddings is provided, computes orthogonalized residuals.
+        Otherwise falls back to 5-dim with zeros for OCN features.
+        """
         adj = defaultdict(set)
         for e in range(edge_index.size(1)):
             s, d = edge_index[0, e].item(), edge_index[1, e].item()
@@ -317,6 +589,15 @@ class StructuralFeatureComputer:
             adj[d].add(s)
 
         max_deg = max((len(v) for v in adj.values()), default=1)
+
+        # Precompute 2-hop reachability counts for path normalization
+        two_hop = defaultdict(int)
+        for node in range(num_nodes):
+            for n1 in adj[node]:
+                for n2 in adj[n1]:
+                    if n2 != node:
+                        two_hop[(node, n2)] = two_hop.get((node, n2), 0) + 1
+
         feats = []
         cn_indices_list = []
 
@@ -335,10 +616,110 @@ class StructuralFeatureComputer:
                 if deg_w > 1:
                     aa += 1.0 / np.log(deg_w)
 
-            feats.append([cn_count, jaccard, aa])
+            # OCN: orthogonalized residual
+            ocn_residual = 0.0
+            if node_embeddings is not None and i < node_embeddings.size(0) and j < node_embeddings.size(0):
+                z_i = node_embeddings[i].detach().cpu().numpy()
+                z_j = node_embeddings[j].detach().cpu().numpy()
+
+                # Raw CN signal: sum of CN node embeddings
+                if len(cn) > 0:
+                    cn_list = list(cn)
+                    cn_embeds = node_embeddings[cn_list].detach().cpu().numpy()
+                    cn_signal = cn_embeds.mean(axis=0)
+
+                    # Project out component explained by endpoint embeddings
+                    pair_basis = np.stack([z_i, z_j])  # (2, D)
+                    # Orthogonal projection: cn_signal - proj(cn_signal onto span(z_i, z_j))
+                    try:
+                        Q, _ = np.linalg.qr(pair_basis.T)  # (D, 2)
+                        proj = Q @ (Q.T @ cn_signal)
+                        residual = cn_signal - proj
+                        ocn_residual = float(np.linalg.norm(residual))
+                    except np.linalg.LinAlgError:
+                        ocn_residual = float(np.linalg.norm(cn_signal))
+
+            # Path normalization: CN count / 2-hop reachability
+            path_reach = max(two_hop.get((i, j), 0), two_hop.get((j, i), 0), 1)
+            path_norm_cn = len(cn) / path_reach
+
+            feats.append([cn_count, jaccard, aa, ocn_residual, path_norm_cn])
             cn_indices_list.append(list(cn))
 
         return torch.tensor(feats, dtype=torch.float32), cn_indices_list
+
+    def compute_intra_node_topology(self, sv_edge_indices_list, n_svs_per_node):
+        """Compute topological fingerprint for each node's internal SV graph.
+
+        For each seg node, characterize its internal connectivity:
+          - cn_density: average CN count among internal SV pairs
+          - connectivity_ratio: actual edges / max possible edges
+          - cn_variance: variance of per-SV degree (homogeneous vs heterogeneous)
+          - spectral_gap: algebraic connectivity (2nd smallest Laplacian eigenvalue)
+
+        Args:
+            sv_edge_indices_list: list of (2, E_i) tensors per node.
+            n_svs_per_node: list of int, SV count per node.
+
+        Returns:
+            topo_feats: (N_seg, 4) tensor.
+        """
+        n_nodes = len(sv_edge_indices_list)
+        topo = []
+
+        for node_idx in range(n_nodes):
+            ei = sv_edge_indices_list[node_idx]
+            n_svs = n_svs_per_node[node_idx] if node_idx < len(n_svs_per_node) else 0
+
+            if n_svs < 2 or ei.size(1) == 0:
+                topo.append([0.0, 0.0, 0.0, 0.0])
+                continue
+
+            # Build adjacency
+            adj = defaultdict(set)
+            for e in range(ei.size(1)):
+                s, d = ei[0, e].item(), ei[1, e].item()
+                adj[s].add(d)
+                adj[d].add(s)
+
+            # CN density: avg CN count among all SV pairs
+            cn_counts = []
+            nodes = list(range(n_svs))
+            for a in nodes:
+                for b in nodes:
+                    if a < b:
+                        cn_counts.append(len(adj[a] & adj[b]))
+            cn_density = float(np.mean(cn_counts)) if cn_counts else 0.0
+
+            # Connectivity ratio
+            max_edges = n_svs * (n_svs - 1) / 2
+            actual_edges = ei.size(1) / 2  # undirected
+            connectivity = actual_edges / max(max_edges, 1)
+
+            # Degree variance
+            degrees = [len(adj[n]) for n in nodes]
+            cn_var = float(np.std(degrees)) if degrees else 0.0
+
+            # Spectral gap (algebraic connectivity)
+            spectral_gap = 0.0
+            if n_svs >= 3:
+                try:
+                    from scipy.sparse import csr_matrix
+                    from scipy.sparse.csgraph import laplacian as sp_laplacian
+                    row = ei[0].numpy()
+                    col = ei[1].numpy()
+                    data = np.ones(len(row))
+                    A = csr_matrix((data, (row, col)), shape=(n_svs, n_svs))
+                    L = sp_laplacian(A, normed=False).toarray()
+                    eigenvalues = np.sort(np.linalg.eigvalsh(L))
+                    if len(eigenvalues) >= 2:
+                        spectral_gap = float(eigenvalues[1])
+                except Exception:
+                    spectral_gap = 0.0
+
+            topo.append([cn_density, connectivity, cn_var, spectral_gap])
+
+        return torch.tensor(topo, dtype=torch.float32)
 
 
 # ── NCN Encoder (GATv2) ──────────────────────────────────────────────
@@ -435,13 +816,17 @@ class NCNEdgeDecoder(nn.Module):
 # ── NCN Full Model ───────────────────────────────────────────────────
 
 class NCNEdgePredictor(nn.Module):
-    """Complete NCN model: GATv2 encoder + tissue-aware edge decoder."""
+    """Hierarchical NCN: IntraNodeAggregator + GATv2 encoder + tissue-aware decoder."""
 
     def __init__(self, config=None):
         super().__init__()
         config = config or GNN
+        self.aggregator = IntraNodeAggregator(
+            sv_feat_dim=SUPERVOXEL["sv_feat_dim"],
+            embed_dim=config["embed_dim"],
+        )
         self.encoder = NCNEncoder(
-            in_dim=config["node_feat_dim"],
+            in_dim=config["node_feat_dim"],  # 68 = 64 embed + 4 topo (added in Phase 3)
             hidden_dim=config["hidden_dim"],
             out_dim=config["embed_dim"],
             num_layers=config["num_layers"],
@@ -452,10 +837,37 @@ class NCNEdgePredictor(nn.Module):
             embed_dim=config["embed_dim"],
             structural_feat_dim=config["structural_feat_dim"],
         )
+        self._use_hierarchy = True  # set False to fallback to flat features
 
     def encode(self, data, return_attention=False):
         edge_attr = data.edge_attr if hasattr(data, 'edge_attr') and data.edge_attr is not None and data.edge_attr.size(0) > 0 else None
-        return self.encoder(data.x, data.edge_index, edge_attr=edge_attr, return_attention=return_attention)
+        device = data.x.device
+
+        # Hierarchical path: aggregate SVs → node embeddings + topology
+        if self._use_hierarchy and hasattr(data, 'sv_features') and len(data.sv_features) > 0:
+            node_embeds, sv_attns = self.aggregator(data.sv_features, device=device)
+
+            # Compute intra-node topology (4-dim per node)
+            sf_computer = StructuralFeatureComputer()
+            sv_ei_list = data.sv_edge_indices if hasattr(data, 'sv_edge_indices') else []
+            n_svs = data.n_svs_per_node if hasattr(data, 'n_svs_per_node') else []
+            if sv_ei_list and n_svs:
+                topo_feats = sf_computer.compute_intra_node_topology(sv_ei_list, n_svs)
+                topo_feats = topo_feats.to(device)
+            else:
+                topo_feats = torch.zeros(node_embeds.size(0), 4, device=device)
+
+            x = torch.cat([node_embeds, topo_feats], dim=-1)  # (N, 68)
+        else:
+            # Fallback: use data.x directly (for backward compatibility)
+            x = data.x
+            if x.size(1) < GNN["node_feat_dim"]:
+                pad = torch.zeros(x.size(0), GNN["node_feat_dim"] - x.size(1), device=device)
+                x = torch.cat([x, pad], dim=-1)
+            sv_attns = []
+
+        z, alphas = self.encoder(x, data.edge_index, edge_attr=edge_attr, return_attention=return_attention)
+        return z, alphas, sv_attns
 
     def decode(self, z, edge_index, structural_feats, cn_indices_list,
                src_tissue, dst_tissue, is_inter_slice):
@@ -465,7 +877,7 @@ class NCNEdgePredictor(nn.Module):
     def forward(self, data, pos_ei, neg_ei, pos_sf, neg_sf, pos_cn, neg_cn,
                 pos_src_t, pos_dst_t, neg_src_t, neg_dst_t,
                 pos_inter, neg_inter, return_attention=False):
-        z, alphas = self.encode(data, return_attention=return_attention)
+        z, alphas, sv_attns = self.encode(data, return_attention=return_attention)
         pos_pred = self.decode(z, pos_ei, pos_sf, pos_cn, pos_src_t, pos_dst_t, pos_inter)
         neg_pred = self.decode(z, neg_ei, neg_sf, neg_cn, neg_src_t, neg_dst_t, neg_inter)
         return pos_pred, neg_pred, z, alphas
@@ -712,8 +1124,17 @@ class ReasoningTraceGenerator:
 
             src_feats = data.x[i]
             dst_feats = data.x[j]
-            src_t1c_mean = src_feats[15].item()
-            dst_t1c_mean = dst_feats[15].item()
+            # Feature index depends on architecture: 35-dim old or 25-dim SV means
+            feat_dim = src_feats.size(0)
+            if feat_dim >= 16:
+                src_t1c_mean = src_feats[15].item()  # T1c mean in old layout
+                dst_t1c_mean = dst_feats[15].item()
+            elif feat_dim >= 5:
+                src_t1c_mean = src_feats[4].item()   # T1ce mean in SV layout (ch1 mean)
+                dst_t1c_mean = dst_feats[4].item()
+            else:
+                src_t1c_mean = src_feats[0].item()
+                dst_t1c_mean = dst_feats[0].item()
 
             trace = (
                 f"Edge ({i}→{j}): {'strong' if conf > 0.7 else 'moderate' if conf > 0.4 else 'weak'} "
@@ -731,6 +1152,345 @@ class ReasoningTraceGenerator:
             traces.append(trace)
 
         return traces
+
+
+class HierarchicalExplainer:
+    """3-level explanation for edge predictions in the hierarchical GNN.
+
+    Level 1 (Structure): WHY are these two seg regions connected?
+      - OCN structural features (CN, Jaccard, orthogonalized residual, path-norm)
+      - Tissue-pair compatibility + spatial distance
+
+    Level 2 (Supervoxel): WHICH parts of each region drove the connection?
+      - IntraNodeAggregator attention weights → top-k supervoxels per endpoint
+
+    Level 3 (Spatial): WHERE in the MRI is the evidence?
+      - Map top-k supervoxels back to voxel coordinates → 3D heatmap
+    """
+
+    def __init__(self, tissue_labels=None):
+        self.tissue_labels = tissue_labels or GNN["tissue_labels"]
+
+    def explain_edge(self, data, edge_idx, z, sv_attentions, structural_feats,
+                     cn_list, src_tissue, dst_tissue, is_inter, sv_labels_3d=None):
+        """Generate a full 3-level explanation for one predicted edge.
+
+        Args:
+            data: PyG Data object.
+            edge_idx: int, index into edge_index.
+            z: (N, D) node embeddings.
+            sv_attentions: list of (K_i,) attention weight tensors per node.
+            structural_feats: (E, 5) OCN features for all edges.
+            cn_list: list of CN index lists per edge.
+            src_tissue, dst_tissue: (E,) tissue labels per edge.
+            is_inter: (E,) inter-slice flags.
+            sv_labels_3d: optional (H, W, D) SV label volume for heatmap.
+
+        Returns:
+            explanation: dict with keys 'text', 'level1', 'level2', 'level3', 'heatmap'.
+        """
+        i = data.edge_index[0, edge_idx].item()
+        j = data.edge_index[1, edge_idx].item()
+
+        src_t = self.tissue_labels.get(src_tissue[edge_idx].item(), "Unknown")
+        dst_t = self.tissue_labels.get(dst_tissue[edge_idx].item(), "Unknown")
+        src_slice = data.slice_ids[i].item()
+        dst_slice = data.slice_ids[j].item()
+        is_cross = is_inter[edge_idx].item() == 1
+
+        # ── Level 1: Structural reasoning ──
+        sf = structural_feats[edge_idx]
+        cn_count = sf[0].item()
+        jaccard = sf[1].item()
+        aa = sf[2].item()
+        ocn_residual = sf[3].item() if sf.size(0) > 3 else 0.0
+        path_norm_cn = sf[4].item() if sf.size(0) > 4 else 0.0
+
+        diff = data.pos[j] - data.pos[i]
+        dist = float(torch.norm(diff))
+
+        level1 = {
+            "src_tissue": src_t,
+            "dst_tissue": dst_t,
+            "distance": dist,
+            "cn_count": cn_count,
+            "jaccard": jaccard,
+            "adamic_adar": aa,
+            "ocn_residual": ocn_residual,
+            "path_norm_cn": path_norm_cn,
+            "is_inter_slice": is_cross,
+            "slice_gap": abs(src_slice - dst_slice),
+        }
+
+        # ── Level 2: Supervoxel attribution ──
+        level2 = {"src_top_svs": [], "dst_top_svs": []}
+
+        if sv_attentions and i < len(sv_attentions) and sv_attentions[i].numel() > 0:
+            src_attn = sv_attentions[i]
+            k = min(3, src_attn.size(0))
+            top_vals, top_idx = src_attn.topk(k)
+            level2["src_top_svs"] = [
+                {"sv_local_idx": int(top_idx[t]), "attention": float(top_vals[t])}
+                for t in range(k)
+            ]
+            level2["src_attn_entropy"] = float(-torch.sum(src_attn * torch.log(src_attn + 1e-8)))
+
+        if sv_attentions and j < len(sv_attentions) and sv_attentions[j].numel() > 0:
+            dst_attn = sv_attentions[j]
+            k = min(3, dst_attn.size(0))
+            top_vals, top_idx = dst_attn.topk(k)
+            level2["dst_top_svs"] = [
+                {"sv_local_idx": int(top_idx[t]), "attention": float(top_vals[t])}
+                for t in range(k)
+            ]
+            level2["dst_attn_entropy"] = float(-torch.sum(dst_attn * torch.log(dst_attn + 1e-8)))
+
+        # ── Level 3: Voxel-space heatmap ──
+        heatmap = None
+        if sv_labels_3d is not None and sv_attentions:
+            heatmap = self._sv_attention_to_heatmap(
+                i, j, sv_attentions, data, sv_labels_3d,
+            )
+
+        # ── Assemble text explanation ──
+        text = self._format_explanation(level1, level2, i, j)
+
+        return {
+            "text": text,
+            "level1": level1,
+            "level2": level2,
+            "level3": {"heatmap": heatmap},
+            "src_node": i,
+            "dst_node": j,
+        }
+
+    def _sv_attention_to_heatmap(self, src_node, dst_node, sv_attentions,
+                                  data, sv_labels_3d):
+        """Map SV attention weights back to voxel space.
+
+        For each important SV, paint its voxels with the attention weight.
+        Returns a heatmap of same shape as sv_labels_3d.
+        """
+        heatmap = np.zeros(sv_labels_3d.shape, dtype=np.float32)
+
+        # We need the mapping from local SV index (within a seg node) to global SV ID
+        # This mapping is stored in the supervoxel result but not in the Data object.
+        # Fallback: use attention weights to paint all SVs in the node proportionally.
+        for node_idx in [src_node, dst_node]:
+            if node_idx >= len(sv_attentions) or sv_attentions[node_idx].numel() == 0:
+                continue
+
+            attn = sv_attentions[node_idx].cpu().numpy()
+
+            # Get the SVs that belong to this seg node by checking which SVs
+            # overlap with the node's tissue mask. We approximate by using
+            # data.n_svs_per_node to know the count.
+            if not hasattr(data, 'n_svs_per_node') or node_idx >= len(data.n_svs_per_node):
+                continue
+
+            n_svs = data.n_svs_per_node[node_idx]
+            if n_svs == 0 or len(attn) != n_svs:
+                continue
+
+            # Find unique SV IDs in the tumor region that correspond to this node
+            # This is an approximation — for exact mapping, the SV-to-comp assignment
+            # would need to be stored in the Data object. For now, we use spatial proximity.
+            node_pos = data.pos[node_idx].cpu().numpy()
+
+            # Paint SVs by finding all unique SV labels and assigning attention
+            # based on proximity to the node centroid
+            unique_svs = np.unique(sv_labels_3d)
+            unique_svs = unique_svs[unique_svs >= 0]  # exclude background (-1)
+
+            H, W, D = sv_labels_3d.shape
+            sv_centroids = []
+            sv_ids = []
+            for sv_id in unique_svs:
+                mask = sv_labels_3d == sv_id
+                if mask.sum() == 0:
+                    continue
+                coords = np.argwhere(mask)
+                centroid = np.array([
+                    coords[:, 0].mean() / H,
+                    coords[:, 1].mean() / W,
+                    coords[:, 2].mean() / D,
+                ])
+                sv_centroids.append(centroid)
+                sv_ids.append(sv_id)
+
+            if not sv_centroids:
+                continue
+
+            sv_centroids = np.stack(sv_centroids)
+            dists = np.linalg.norm(sv_centroids - node_pos, axis=1)
+            closest_indices = np.argsort(dists)[:n_svs]
+
+            for local_idx, global_idx in enumerate(closest_indices):
+                if local_idx < len(attn):
+                    sv_id = sv_ids[global_idx]
+                    sv_mask = sv_labels_3d == sv_id
+                    heatmap[sv_mask] = max(heatmap[sv_mask].max(), attn[local_idx])
+
+        return heatmap
+
+    def _format_explanation(self, level1, level2, src_node, dst_node):
+        """Format a human-readable text explanation."""
+        L1 = level1
+        strength = "strong" if L1["jaccard"] > 0.3 else "moderate" if L1["jaccard"] > 0.1 else "weak"
+
+        lines = [
+            f"Edge ({src_node}→{dst_node}): {L1['src_tissue']} → {L1['dst_tissue']}",
+            f"",
+            f"Level 1 — Structural Evidence ({strength}):",
+            f"  Distance: {L1['distance']:.3f} | CN: {L1['cn_count']:.2f} | Jaccard: {L1['jaccard']:.3f}",
+            f"  Adamic-Adar: {L1['adamic_adar']:.3f} | OCN residual: {L1['ocn_residual']:.3f}",
+            f"  Path-norm CN: {L1['path_norm_cn']:.3f}",
+        ]
+
+        if L1["is_inter_slice"]:
+            lines.append(f"  Cross-slice gap: {L1['slice_gap']} slices")
+
+        if level2.get("src_top_svs"):
+            lines.append(f"")
+            lines.append(f"Level 2 — Supervoxel Attribution:")
+            src_svs = level2["src_top_svs"]
+            entropy = level2.get("src_attn_entropy", 0)
+            focus = "focused" if entropy < 1.0 else "distributed"
+            lines.append(f"  Source ({L1['src_tissue']}): {focus} attention (H={entropy:.2f})")
+            for sv in src_svs:
+                lines.append(f"    SV#{sv['sv_local_idx']}: weight={sv['attention']:.3f}")
+
+        if level2.get("dst_top_svs"):
+            dst_svs = level2["dst_top_svs"]
+            entropy = level2.get("dst_attn_entropy", 0)
+            focus = "focused" if entropy < 1.0 else "distributed"
+            lines.append(f"  Target ({L1['dst_tissue']}): {focus} attention (H={entropy:.2f})")
+            for sv in dst_svs:
+                lines.append(f"    SV#{sv['sv_local_idx']}: weight={sv['attention']:.3f}")
+
+        return "\n".join(lines)
+
+    def explain_top_k(self, data, z, pos_pred, sv_attentions, structural_feats,
+                      cn_list, src_tissue, dst_tissue, is_inter,
+                      sv_labels_3d=None, top_k=5):
+        """Generate explanations for the top-k highest-confidence edges."""
+        scores = torch.sigmoid(pos_pred).detach().cpu().numpy()
+        top_indices = np.argsort(scores)[::-1][:top_k]
+
+        explanations = []
+        for idx in top_indices:
+            conf = scores[idx]
+            exp = self.explain_edge(
+                data, idx, z, sv_attentions, structural_feats,
+                cn_list, src_tissue, dst_tissue, is_inter, sv_labels_3d,
+            )
+            exp["confidence"] = float(conf)
+            explanations.append(exp)
+
+        return explanations
+
+
+def plot_hierarchical_explanation(data, explanation, mri_slice_2d=None, seg_slice_2d=None,
+                                  heatmap_slice_2d=None, slice_idx=None):
+    """4-panel visualization of a hierarchical edge explanation.
+
+    Panel 1: Graph structure with highlighted edge
+    Panel 2: SV attention heatmap (if available)
+    Panel 3: Structural feature breakdown
+    Panel 4: Text explanation
+    """
+    fig, axes = plt.subplots(1, 4, figsize=(24, 6))
+
+    # Panel 1: Graph with highlighted edge
+    ax = axes[0]
+    pos = data.pos.cpu().numpy()
+    tl = data.tissue_labels.cpu().numpy()
+    colors_map = {1: '#e74c3c', 2: '#2ecc71', 3: '#f39c12'}
+
+    for tissue in [1, 2, 3]:
+        mask = tl == tissue
+        if mask.sum() > 0:
+            ax.scatter(pos[mask, 0], pos[mask, 1], c=colors_map[tissue],
+                       s=80, alpha=0.8, label=GNN["tissue_labels"].get(tissue, str(tissue)),
+                       edgecolors='black', linewidths=0.5)
+
+    # Draw all edges in gray
+    ei = data.edge_index.cpu().numpy()
+    for e in range(ei.shape[1]):
+        si, di = ei[0, e], ei[1, e]
+        ax.plot([pos[si, 0], pos[di, 0]], [pos[si, 1], pos[di, 1]],
+                color='gray', alpha=0.15, linewidth=0.5)
+
+    # Highlight explained edge
+    src = explanation["src_node"]
+    dst = explanation["dst_node"]
+    ax.plot([pos[src, 0], pos[dst, 0]], [pos[src, 1], pos[dst, 1]],
+            color='#3498db', linewidth=3, alpha=0.9, zorder=5)
+    ax.scatter([pos[src, 0], pos[dst, 0]], [pos[src, 1], pos[dst, 1]],
+               c='#3498db', s=150, zorder=6, edgecolors='white', linewidths=2)
+
+    ax.set_title("Graph + Highlighted Edge", fontsize=10)
+    ax.legend(fontsize=7)
+    ax.set_aspect('equal')
+
+    # Panel 2: SV attention heatmap
+    ax2 = axes[1]
+    if heatmap_slice_2d is not None:
+        im = ax2.imshow(heatmap_slice_2d, cmap='hot', interpolation='nearest')
+        if seg_slice_2d is not None:
+            ax2.contour(seg_slice_2d, levels=[0.5, 1.5, 2.5], colors='cyan',
+                        linewidths=0.5, alpha=0.7)
+        plt.colorbar(im, ax=ax2, fraction=0.046)
+        ax2.set_title(f"SV Attention Heatmap (z={slice_idx})", fontsize=10)
+    else:
+        # Show attention bar chart instead
+        level2 = explanation["level2"]
+        labels, weights = [], []
+        for prefix, key in [("Src", "src_top_svs"), ("Dst", "dst_top_svs")]:
+            for sv_info in level2.get(key, []):
+                labels.append(f"{prefix} SV#{sv_info['sv_local_idx']}")
+                weights.append(sv_info["attention"])
+        if labels:
+            bar_colors = ['#e74c3c' if l.startswith("Src") else '#2ecc71' for l in labels]
+            ax2.barh(labels, weights, color=bar_colors, alpha=0.8)
+            ax2.set_xlabel("Attention Weight")
+            ax2.set_title("Top SV Attention Weights", fontsize=10)
+            ax2.set_xlim(0, 1)
+        else:
+            ax2.text(0.5, 0.5, "No SV data", ha='center', va='center', fontsize=12)
+            ax2.set_title("SV Attention", fontsize=10)
+
+    # Panel 3: Structural features radar
+    ax3 = axes[2]
+    L1 = explanation["level1"]
+    feat_names = ["CN", "Jaccard", "AA", "OCN\nResidual", "Path\nNorm CN"]
+    feat_vals = [L1["cn_count"], L1["jaccard"], min(L1["adamic_adar"], 1.0),
+                 min(L1["ocn_residual"], 1.0), min(L1["path_norm_cn"], 1.0)]
+
+    x_pos = np.arange(len(feat_names))
+    colors_bar = ['#3498db', '#2ecc71', '#e74c3c', '#9b59b6', '#f39c12']
+    ax3.bar(x_pos, feat_vals, color=colors_bar, alpha=0.8, edgecolor='black', linewidth=0.5)
+    ax3.set_xticks(x_pos)
+    ax3.set_xticklabels(feat_names, fontsize=8)
+    ax3.set_ylim(0, 1.1)
+    ax3.set_title("OCN Structural Features", fontsize=10)
+    ax3.set_ylabel("Value")
+
+    # Panel 4: Text explanation
+    ax4 = axes[3]
+    ax4.axis('off')
+    ax4.text(0.05, 0.95, explanation["text"], transform=ax4.transAxes,
+             fontsize=8, verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='#ecf0f1', alpha=0.8))
+    conf = explanation.get("confidence", 0)
+    ax4.set_title(f"Explanation (conf={conf:.3f})", fontsize=10)
+
+    plt.suptitle(
+        f"Hierarchical Edge Explanation — {L1['src_tissue']} → {L1['dst_tissue']}",
+        fontsize=13, fontweight='bold',
+    )
+    plt.tight_layout()
+    plt.show()
 
 
 # ── Visualization ─────────────────────────────────────────────────────
@@ -879,7 +1639,7 @@ if __name__ == "__main__":
         pos_sf, pos_cn = sf_computer.compute(demo_graph.edge_index, demo_graph.x.size(0), pos_ei)
         pos_src_t, pos_dst_t, pos_inter = get_edge_metadata(demo_graph, pos_ei)
 
-        z, alphas = model.encode(data, return_attention=True)
+        z, alphas, sv_attns = model.encode(data, return_attention=True)
         pos_pred = model.decode(
             z, pos_ei, pos_sf, pos_cn,
             pos_src_t.to(SHARED["device"]),
@@ -898,7 +1658,21 @@ if __name__ == "__main__":
             print(t)
             print()
 
+        # Hierarchical 3-level explanations
+        print(f"\n--- Hierarchical Explanations for {demo_graph.case_id} ---")
+        explainer = HierarchicalExplainer()
+        explanations = explainer.explain_top_k(
+            demo_graph, z, pos_pred, sv_attns, pos_sf, pos_cn,
+            pos_src_t, pos_dst_t, pos_inter, top_k=3,
+        )
+
+        for exp in explanations:
+            print(exp["text"])
+            print(f"  Confidence: {exp['confidence']:.3f}")
+            print()
+            plot_hierarchical_explanation(demo_graph, exp)
+
         plot_results(demo_graph, pos_pred, test_metrics["tissue_pairs"],
                      test_metrics["all_labels"], test_metrics["all_scores"])
 
-    print("\n=== BraTS 3D GNN Pipeline Complete ===")
+    print("\n=== BraTS Hierarchical GNN Pipeline Complete ===")

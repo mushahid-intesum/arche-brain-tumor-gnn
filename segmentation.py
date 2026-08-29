@@ -380,21 +380,26 @@ def evaluate_segmentation(model, loader, criterion=None):
 # ── Export ────────────────────────────────────────────────────────────
 
 def export_for_gnn(model, train_meta, val_meta, test_meta, config=None):
-    """Export predicted masks, GT masks, and raw slices for the GNN pipeline."""
+    """Export predicted masks, GT masks, raw slices, and 3D volumes for the GNN pipeline."""
     config = config or SEGMENTATION
     output = config["output_dir"]
     masks_dir = output / "masks"
     raw_dir = output / "raw_slices"
     gt_dir = output / "gt_masks"
+    vol_dir = output / "volumes"
     masks_dir.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
     gt_dir.mkdir(parents=True, exist_ok=True)
+    vol_dir.mkdir(parents=True, exist_ok=True)
 
     metadata = {
         "case_ids": [], "slice_indices": [],
         "mask_files": [], "raw_files": [], "gt_files": [],
         "splits": [], "class_names": config["class_names"],
     }
+
+    # Group slices by case for 3D volume reconstruction
+    case_slices = {}  # case_id → list of (slice_idx, raw_4ch, pred_mask, split)
 
     model.eval()
     count = 0
@@ -420,10 +425,39 @@ def export_for_gnn(model, train_meta, val_meta, test_meta, config=None):
                 metadata["splits"].append(split_name)
                 count += 1
 
+                # Collect for 3D volume assembly
+                case_id = m["case_id"]
+                if case_id not in case_slices:
+                    case_slices[case_id] = []
+                case_slices[case_id].append({
+                    "slice_idx": m["slice_idx"],
+                    "raw": img,       # (4, H, W)
+                    "seg": pred,      # (H, W)
+                    "split": split_name,
+                })
+
             print(f"  Exported {split_name}: {len(split_meta)} slices")
 
+    # Assemble and save 3D volumes per case
+    vol_count = 0
+    for case_id, slices in case_slices.items():
+        slices.sort(key=lambda s: s["slice_idx"])
+        H, W = slices[0]["raw"].shape[1], slices[0]["raw"].shape[2]
+        D = len(slices)
+
+        raw_3d = np.zeros((4, H, W, D), dtype=np.float32)
+        seg_3d = np.zeros((H, W, D), dtype=np.uint8)
+
+        for d, s in enumerate(slices):
+            raw_3d[:, :, :, d] = s["raw"]
+            seg_3d[:, :, d] = s["seg"]
+
+        np.save(str(vol_dir / f"{case_id}_raw4ch.npy"), raw_3d)
+        np.save(str(vol_dir / f"{case_id}_seg.npy"), seg_3d)
+        vol_count += 1
+
     torch.save(metadata, str(output / "metadata.pt"))
-    print(f"Total exported: {count} slices → {output}")
+    print(f"Total exported: {count} slices, {vol_count} 3D volumes → {output}")
     return metadata
 
 

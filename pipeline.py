@@ -213,7 +213,7 @@ def run_gnn():
         pos_sf, pos_cn = sf_computer.compute(demo_graph.edge_index, demo_graph.x.size(0), pos_ei)
         pos_src_t, pos_dst_t, pos_inter = gnn.get_edge_metadata(demo_graph, pos_ei)
 
-        z, _ = model.encode(data, return_attention=True)
+        z, _, sv_attns = model.encode(data, return_attention=True)
         pos_pred = model.decode(
             z, pos_ei, pos_sf, pos_cn,
             pos_src_t.to(SHARED["device"]),

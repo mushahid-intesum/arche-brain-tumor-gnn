@@ -103,17 +103,29 @@ SEGMENTATION = {
 }
 
 
+# === Phase 3.5: Supervoxel Generation ===
+
+SUPERVOXEL = {
+    "n_segments": 500,          # initial SV count before pruning
+    "compactness": 0.1,         # SLIC compactness (low = more intensity-driven)
+    "sv_feat_dim": 25,          # 22 base + 3 relative PE
+    "intra_k": 5,               # KNN within each seg component
+    "min_sv_volume": 20,        # minimum voxels per SV
+    "cache_dir": Path("brats_outputs/supervoxels"),
+}
+
+
 # === Phase 4: 3D GNN Edge Prediction (BraTS outputs) ===
 
 GNN = {
     "brats_output_dir": Path("brats_outputs"),
-    "node_feat_dim": 35,
+    "node_feat_dim": 68,        # 64 (aggregator embed) + 4 (intra-node topology)
     "hidden_dim": 128,
     "embed_dim": 64,
     "num_heads": 4,
     "num_layers": 3,
     "edge_attr_dim": 4,
-    "structural_feat_dim": 3,
+    "structural_feat_dim": 5,   # 3 base + 2 OCN (residual + path-norm)
     "min_region_area": 10,
     "k_neighbors": 5,
     "inter_slice_dist_thresh": 50.0,

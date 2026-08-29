@@ -425,36 +425,46 @@ def export_for_gnn(model, train_meta, val_meta, test_meta, config=None):
                 metadata["splits"].append(split_name)
                 count += 1
 
-                # Collect for 3D volume assembly
+                # Track file paths for 3D volume assembly (NOT raw data)
                 case_id = m["case_id"]
                 if case_id not in case_slices:
                     case_slices[case_id] = []
                 case_slices[case_id].append({
                     "slice_idx": m["slice_idx"],
-                    "raw": img,       # (4, H, W)
-                    "seg": pred,      # (H, W)
-                    "split": split_name,
+                    "raw_path": str(raw_dir / f"{fname}_raw.npy"),
+                    "seg_path": str(masks_dir / f"{fname}_pred.npy"),
                 })
 
             print(f"  Exported {split_name}: {len(split_meta)} slices")
 
-    # Assemble and save 3D volumes per case
+    # Assemble and save 3D volumes per case (load one case at a time)
     vol_count = 0
     for case_id, slices in case_slices.items():
         slices.sort(key=lambda s: s["slice_idx"])
-        H, W = slices[0]["raw"].shape[1], slices[0]["raw"].shape[2]
+
+        # Load first slice to get dimensions
+        first_raw = np.load(slices[0]["raw_path"])
+        H, W = first_raw.shape[1], first_raw.shape[2]
         D = len(slices)
 
         raw_3d = np.zeros((4, H, W, D), dtype=np.float32)
         seg_3d = np.zeros((H, W, D), dtype=np.uint8)
 
-        for d, s in enumerate(slices):
-            raw_3d[:, :, :, d] = s["raw"]
-            seg_3d[:, :, d] = s["seg"]
+        raw_3d[:, :, :, 0] = first_raw
+        seg_3d[:, :, 0] = np.load(slices[0]["seg_path"])
+        del first_raw
+
+        for d in range(1, D):
+            raw_3d[:, :, :, d] = np.load(slices[d]["raw_path"])
+            seg_3d[:, :, d] = np.load(slices[d]["seg_path"])
 
         np.save(str(vol_dir / f"{case_id}_raw4ch.npy"), raw_3d)
         np.save(str(vol_dir / f"{case_id}_seg.npy"), seg_3d)
+        del raw_3d, seg_3d  # free immediately
         vol_count += 1
+
+        if vol_count % 20 == 0:
+            print(f"  Assembled {vol_count} volumes...")
 
     torch.save(metadata, str(output / "metadata.pt"))
     print(f"Total exported: {count} slices, {vol_count} 3D volumes → {output}")

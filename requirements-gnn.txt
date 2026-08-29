@@ -1,0 +1,28 @@
+# ============================================
+# GNN: Hierarchical Supervoxel-Segmentation GNN
+# ============================================
+# Includes all non-GNN dependencies plus graph-specific packages.
+
+# --- Core (same as requirements.txt) ---
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.2.0
+matplotlib>=3.7.0
+Pillow>=9.0.0
+nibabel>=5.0.0
+opencv-python>=4.7.0
+
+# --- Graph Neural Networks ---
+torch-geometric>=2.4.0
+# PyG sparse backends (install matching your torch+CUDA version):
+#   pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-{TORCH_VERSION}+{CUDA_VERSION}.html
+# Example for torch 2.13.0 + CPU:
+#   pip install torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.13.0+cpu.html
+
+# --- Supervoxel Generation ---
+scikit-image>=0.21.0
+
+# --- Graph utilities ---
+networkx>=3.0

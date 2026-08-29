@@ -33,3 +33,4 @@ Thumbs.db
 *.log
 
 BraTS/
+brats_outputs/

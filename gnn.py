@@ -1,3 +1,9 @@
+"""
+Phase 4: 3D GNN Edge Prediction + Reasoning Traces
+NCN (Neural Common Neighbor) architecture with tissue-aware decoder.
+Input: brats_outputs/ from segmentation pipeline (predicted masks + raw MRI slices)
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,65 +18,19 @@ from torch_geometric.data import Data
 from torch_geometric.utils import to_undirected
 from torch_geometric.nn import knn_graph, GATv2Conv, LayerNorm
 from torch_geometric.utils import negative_sampling
-from sklearn.metrics import roc_auc_score, average_precision_score, confusion_matrix
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+from config import SHARED, GNN
 
 
-GNN_CONFIG = {
-    "brats_output_dir": Path("brats_outputs"),
-    "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    "seed": 42,
-    "img_size": 224,
-    "node_feat_dim": 35,
-    "hidden_dim": 128,
-    "embed_dim": 64,
-    "num_heads": 4,
-    "num_layers": 3,
-    "edge_attr_dim": 4,
-    "structural_feat_dim": 3,
-    "min_region_area": 10,
-    "k_neighbors": 5,
-    "inter_slice_dist_thresh": 50.0,
-    "gnn_epochs": 80,
-    "gnn_lr": 5e-4,
-    "gnn_weight_decay": 1e-4,
-    "modalities": ["t1n", "t1c", "t2w", "t2f"],
-    "tissue_labels": {1: "NCR", 2: "ED", 3: "ET"},
-}
+# ══════════════════════════════════════════════════════════════════════
+# Sub-phase 5A: Feature Extraction & Graph Construction
+# ══════════════════════════════════════════════════════════════════════
 
-torch.manual_seed(GNN_CONFIG["seed"])
-np.random.seed(GNN_CONFIG["seed"])
-random.seed(GNN_CONFIG["seed"])
-
-print(f"Device: {GNN_CONFIG['device']}")
-
-
-
-print("Loading BraTS pipeline outputs...")
-metadata = torch.load(str(GNN_CONFIG["brats_output_dir"] / "metadata.pt"), weights_only=False)
-
-masks_dir = GNN_CONFIG["brats_output_dir"] / "masks"
-raw_dir = GNN_CONFIG["brats_output_dir"] / "raw_slices"
-
-patient_slices = defaultdict(list)
-for i in range(len(metadata["case_ids"])):
-    case_id = metadata["case_ids"][i]
-    patient_slices[case_id].append({
-        "mask_file": masks_dir / metadata["mask_files"][i],
-        "raw_file": raw_dir / metadata["raw_files"][i],
-        "slice_idx": metadata["slice_indices"][i],
-        "split": metadata["splits"][i],
-    })
-
-for case_id in patient_slices:
-    patient_slices[case_id].sort(key=lambda s: s["slice_idx"])
-
-print(f"Loaded {len(metadata['case_ids'])} slices from {len(patient_slices)} patients")
-slice_counts = [len(v) for v in patient_slices.values()]
-print(f"Slices per patient: min={min(slice_counts)}, max={max(slice_counts)}, mean={np.mean(slice_counts):.1f}")
-
-
+# ── Feature Extractors ────────────────────────────────────────────────
 
 def compute_region_raw_features(raw_4ch, component_mask):
+    """Per-modality intensity stats: mean, std, range, skewness (4 × 4 = 16 dims)."""
     feats = []
     for ch in range(4):
         pixels = raw_4ch[ch][component_mask == 1]
@@ -86,6 +46,7 @@ def compute_region_raw_features(raw_4ch, component_mask):
 
 
 def compute_boundary_features(raw_4ch, component_mask):
+    """Gradient magnitude at boundary + texture contrast (2 dims)."""
     t1c = raw_4ch[1]
     dilated = cv2.dilate(component_mask, np.ones((3, 3), np.uint8), iterations=1)
     boundary = dilated - component_mask
@@ -103,6 +64,7 @@ def compute_boundary_features(raw_4ch, component_mask):
 
 
 def compute_crossmodal_features(raw_4ch, component_mask):
+    """Cross-modal ratios: enhancement, edema signal, diffs (4 dims)."""
     if component_mask.sum() == 0:
         return [0.0, 0.0, 0.0, 0.0]
     means = []
@@ -116,9 +78,13 @@ def compute_crossmodal_features(raw_4ch, component_mask):
     return [enhancement, edema_sig, t1c_t2w_diff, flair_t2w_diff]
 
 
-def extract_regions_multiclass(mask_np, raw_4ch, slice_idx, total_slices, config):
+# ── Region Extraction ─────────────────────────────────────────────────
+
+def extract_regions_multiclass(mask_np, raw_4ch, slice_idx, total_slices, config=None):
+    """Extract connected components per tissue type → node features (35-dim)."""
+    config = config or GNN
     regions = []
-    img_size = config["img_size"]
+    img_size = SHARED["img_size"]
     tumor_area = float((mask_np > 0).sum())
     tumor_ratio = tumor_area / (img_size * img_size)
     z_norm = slice_idx / max(total_slices, 1)
@@ -153,17 +119,11 @@ def extract_regions_multiclass(mask_np, raw_4ch, slice_idx, total_slices, config
             crossmodal_feats = compute_crossmodal_features(raw_4ch, component_mask)
 
             feat = [
-                cx / img_size,
-                cy / img_size,
-                z_norm,
-                area / (img_size * img_size),
-                w / img_size,
-                h / img_size,
-                aspect_ratio,
-                solidity,
+                cx / img_size, cy / img_size, z_norm,           # 3D position (3)
+                area / (img_size * img_size), w / img_size,     # morphology (5)
+                h / img_size, aspect_ratio, solidity,
             ] + tissue_onehot + raw_feats + boundary_feats + crossmodal_feats + [
-                z_norm,
-                tumor_ratio,
+                z_norm, tumor_ratio,                             # slice context (2)
             ]
 
             regions.append({
@@ -176,16 +136,18 @@ def extract_regions_multiclass(mask_np, raw_4ch, slice_idx, total_slices, config
     return regions
 
 
-def build_3d_graph(case_id, slice_list, config):
+# ── 3D Graph Construction ────────────────────────────────────────────
+
+def build_3d_graph(case_id, slice_list, config=None):
+    """Build a single 3D volumetric graph for one patient."""
+    config = config or GNN
     all_regions = []
     total_slices = max(s["slice_idx"] for s in slice_list) - min(s["slice_idx"] for s in slice_list) + 1
 
     for s_info in slice_list:
         mask = np.load(str(s_info["mask_file"]))
         raw = np.load(str(s_info["raw_file"]))
-        regions = extract_regions_multiclass(
-            mask, raw, s_info["slice_idx"], total_slices, config
-        )
+        regions = extract_regions_multiclass(mask, raw, s_info["slice_idx"], total_slices, config)
         all_regions.extend(regions)
 
     if len(all_regions) < 2:
@@ -207,6 +169,7 @@ def build_3d_graph(case_id, slice_list, config):
     for i, r in enumerate(all_regions):
         slice_to_nodes[r["slice_idx"]].append(i)
 
+    # Intra-slice edges: KNN within each slice
     intra_src, intra_dst = [], []
     for s_idx, node_ids in slice_to_nodes.items():
         if len(node_ids) < 2:
@@ -220,6 +183,7 @@ def build_3d_graph(case_id, slice_list, config):
             intra_src.append(node_ids[local_ei[0, e].item()])
             intra_dst.append(node_ids[local_ei[1, e].item()])
 
+    # Inter-slice edges: spatially close + tissue compatible across adjacent slices
     inter_src, inter_dst = [], []
     sorted_slices = sorted(slice_to_nodes.keys())
     for idx in range(len(sorted_slices) - 1):
@@ -266,7 +230,7 @@ def build_3d_graph(case_id, slice_list, config):
             slice_gap = abs(slice_ids[si].item() - slice_ids[di].item()) / max(total_slices, 1)
             same_tissue = 1.0 if tissue_labels[si].item() == tissue_labels[di].item() else 0.0
             edge_attr.append([
-                dist / config["img_size"],
+                dist / SHARED["img_size"],
                 angle / np.pi,
                 slice_gap,
                 same_tissue,
@@ -284,102 +248,67 @@ def build_3d_graph(case_id, slice_list, config):
     return data
 
 
+def load_metadata(config=None):
+    """Load brats_outputs metadata and organize by patient."""
+    config = config or GNN
+    metadata = torch.load(str(config["brats_output_dir"] / "metadata.pt"), weights_only=False)
+    masks_dir = config["brats_output_dir"] / "masks"
+    raw_dir = config["brats_output_dir"] / "raw_slices"
 
-print("\nBuilding 3D volumetric graphs...")
-graphs = []
-graph_case_ids = []
-graph_splits = []
+    patient_slices = defaultdict(list)
+    for i in range(len(metadata["case_ids"])):
+        case_id = metadata["case_ids"][i]
+        patient_slices[case_id].append({
+            "mask_file": masks_dir / metadata["mask_files"][i],
+            "raw_file": raw_dir / metadata["raw_files"][i],
+            "slice_idx": metadata["slice_indices"][i],
+            "split": metadata["splits"][i],
+        })
 
-for case_id, slice_list in patient_slices.items():
-    g = build_3d_graph(case_id, slice_list, GNN_CONFIG)
-    g.case_id = case_id
-    graphs.append(g)
-    graph_case_ids.append(case_id)
-    graph_splits.append(slice_list[0]["split"])
+    for case_id in patient_slices:
+        patient_slices[case_id].sort(key=lambda s: s["slice_idx"])
 
-print(f"Built {len(graphs)} 3D volumetric graphs")
-
-node_counts = [g.x.size(0) for g in graphs]
-edge_counts = [g.edge_index.size(1) for g in graphs]
-print(f"Nodes per graph: min={min(node_counts)}, max={max(node_counts)}, mean={np.mean(node_counts):.1f}")
-print(f"Edges per graph: min={min(edge_counts)}, max={max(edge_counts)}, mean={np.mean(edge_counts):.1f}")
-
-inter_count = 0
-intra_count = 0
-for g in graphs:
-    if g.edge_index.size(1) == 0:
-        continue
-    for e in range(g.edge_index.size(1)):
-        si = g.edge_index[0, e].item()
-        di = g.edge_index[1, e].item()
-        if g.slice_ids[si].item() != g.slice_ids[di].item():
-            inter_count += 1
-        else:
-            intra_count += 1
-print(f"Edge types: intra-slice={intra_count:,}, inter-slice={inter_count:,} ({100*inter_count/max(intra_count+inter_count,1):.1f}%)")
-
-tissue_dist = defaultdict(int)
-for g in graphs:
-    for t in g.tissue_labels.numpy():
-        tissue_dist[GNN_CONFIG["tissue_labels"][t]] += 1
-print(f"Node tissue distribution: {dict(tissue_dist)}")
-
-train_graphs = [g for g, s in zip(graphs, graph_splits) if s == "train"]
-val_graphs = [g for g, s in zip(graphs, graph_splits) if s == "val"]
-test_graphs = [g for g, s in zip(graphs, graph_splits) if s == "test"]
-print(f"Split: train={len(train_graphs)}, val={len(val_graphs)}, test={len(test_graphs)}")
+    return patient_slices, metadata
 
 
+def build_all_graphs(config=None):
+    """Build 3D graphs for all patients and split into train/val/test."""
+    config = config or GNN
+    patient_slices, metadata = load_metadata(config)
 
-fig = plt.figure(figsize=(18, 6))
+    print(f"Loaded {len(metadata['case_ids'])} slices from {len(patient_slices)} patients")
 
-for plot_idx in range(min(3, len(graphs))):
-    g = graphs[plot_idx]
-    if g.edge_index.size(1) == 0:
-        continue
+    print("Building 3D volumetric graphs...")
+    graphs, splits = [], []
+    for case_id, slice_list in patient_slices.items():
+        g = build_3d_graph(case_id, slice_list, config)
+        g.case_id = case_id
+        graphs.append(g)
+        splits.append(slice_list[0]["split"])
 
-    ax = fig.add_subplot(1, 3, plot_idx + 1, projection='3d')
-    pos = g.pos.numpy()
-    tl = g.tissue_labels.numpy()
+    print(f"Built {len(graphs)} graphs")
+    node_counts = [g.x.size(0) for g in graphs]
+    edge_counts = [g.edge_index.size(1) for g in graphs]
+    print(f"  Nodes: min={min(node_counts)}, max={max(node_counts)}, mean={np.mean(node_counts):.1f}")
+    print(f"  Edges: min={min(edge_counts)}, max={max(edge_counts)}, mean={np.mean(edge_counts):.1f}")
 
-    colors = {1: 'red', 2: 'green', 3: 'gold'}
-    for tissue in [1, 2, 3]:
-        mask = tl == tissue
-        if mask.sum() > 0:
-            ax.scatter(
-                pos[mask, 0], pos[mask, 1], pos[mask, 2],
-                c=colors[tissue], s=40, alpha=0.8,
-                label=GNN_CONFIG["tissue_labels"][tissue],
-            )
+    train_graphs = [g for g, s in zip(graphs, splits) if s == "train"]
+    val_graphs = [g for g, s in zip(graphs, splits) if s == "val"]
+    test_graphs = [g for g, s in zip(graphs, splits) if s == "test"]
+    print(f"  Split: train={len(train_graphs)}, val={len(val_graphs)}, test={len(test_graphs)}")
 
-    ei = g.edge_index.numpy()
-    for e in range(ei.shape[1]):
-        si, di = ei[0, e], ei[1, e]
-        is_inter = g.slice_ids[si].item() != g.slice_ids[di].item()
-        color = 'blue' if is_inter else 'gray'
-        alpha = 0.6 if is_inter else 0.15
-        ax.plot(
-            [pos[si, 0], pos[di, 0]],
-            [pos[si, 1], pos[di, 1]],
-            [pos[si, 2], pos[di, 2]],
-            color=color, alpha=alpha, linewidth=0.5,
-        )
-
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Slice")
-    ax.set_title(f"{g.case_id[-7:]} | {g.x.size(0)} nodes", fontsize=9)
-    ax.legend(fontsize=7)
-
-plt.suptitle("3D Tumor Graphs (blue=inter-slice, gray=intra-slice)", fontsize=13)
-plt.tight_layout()
-plt.show()
-
-print("\n=== Phase 1 Complete: 3D Graph Construction ===")
+    return train_graphs, val_graphs, test_graphs
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Sub-phase 5B: Structural Features & NCN Architecture
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Structural Features ──────────────────────────────────────────────
 
 class StructuralFeatureComputer:
+    """Compute CN count, Jaccard, Adamic-Adar for candidate edges."""
+
     def compute(self, edge_index, num_nodes, candidate_edges, tissue_labels=None, slice_ids=None):
         adj = defaultdict(set)
         for e in range(edge_index.size(1)):
@@ -397,7 +326,6 @@ class StructuralFeatureComputer:
 
             cn = adj[i] & adj[j]
             cn_count = len(cn) / max(max_deg, 1)
-
             union = adj[i] | adj[j]
             jaccard = len(cn) / max(len(union), 1)
 
@@ -412,19 +340,22 @@ class StructuralFeatureComputer:
 
         return torch.tensor(feats, dtype=torch.float32), cn_indices_list
 
-sf_computer = StructuralFeatureComputer()
-print("StructuralFeatureComputer initialized")
 
-
+# ── NCN Encoder (GATv2) ──────────────────────────────────────────────
 
 class NCNEncoder(nn.Module):
+    """3-layer GATv2 with residual connections and edge-attr awareness."""
+
     def __init__(self, in_dim, hidden_dim, out_dim, num_layers=3, heads=4, edge_dim=4, dropout=0.2):
         super().__init__()
         self.input_proj = nn.Linear(in_dim, hidden_dim)
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(num_layers):
-            self.convs.append(GATv2Conv(hidden_dim, hidden_dim // heads, heads=heads, edge_dim=edge_dim, dropout=dropout, concat=True))
+            self.convs.append(GATv2Conv(
+                hidden_dim, hidden_dim // heads, heads=heads,
+                edge_dim=edge_dim, dropout=dropout, concat=True,
+            ))
             self.norms.append(LayerNorm(hidden_dim))
         self.out_proj = nn.Linear(hidden_dim, out_dim)
         self.dropout = dropout
@@ -449,7 +380,11 @@ class NCNEncoder(nn.Module):
         return out, alphas
 
 
+# ── NCN Edge Decoder ─────────────────────────────────────────────────
+
 class NCNEdgeDecoder(nn.Module):
+    """6-signal decoder: Hadamard + concat + CN pool + structural + tissue-pair + edge-type."""
+
     def __init__(self, embed_dim, structural_feat_dim=3, num_tissue_types=3):
         super().__init__()
         self.sf_proj = nn.Linear(structural_feat_dim, embed_dim)
@@ -457,8 +392,8 @@ class NCNEdgeDecoder(nn.Module):
         self.edge_type_embed = nn.Embedding(2, 32)
         self.num_tissue_types = num_tissue_types
 
-        base_dim = embed_dim + embed_dim * 2 + embed_dim + embed_dim
-        cat_dim = base_dim + embed_dim + 32
+        # hadamard(64) + concat(128) + cn_pool(64) + sf(64) + tissue(64) + edge_type(32) = 416
+        cat_dim = embed_dim + embed_dim * 2 + embed_dim + embed_dim + embed_dim + 32
 
         self.mlp = nn.Sequential(
             nn.LayerNorm(cat_dim),
@@ -497,9 +432,14 @@ class NCNEdgeDecoder(nn.Module):
         return self.mlp(combined).squeeze(-1)
 
 
+# ── NCN Full Model ───────────────────────────────────────────────────
+
 class NCNEdgePredictor(nn.Module):
-    def __init__(self, config):
+    """Complete NCN model: GATv2 encoder + tissue-aware edge decoder."""
+
+    def __init__(self, config=None):
         super().__init__()
+        config = config or GNN
         self.encoder = NCNEncoder(
             in_dim=config["node_feat_dim"],
             hidden_dim=config["hidden_dim"],
@@ -531,16 +471,14 @@ class NCNEdgePredictor(nn.Module):
         return pos_pred, neg_pred, z, alphas
 
 
-print("NCNEdgePredictor initialized")
-model = NCNEdgePredictor(GNN_CONFIG).to(GNN_CONFIG["device"])
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Total parameters: {total_params:,}")
+# ══════════════════════════════════════════════════════════════════════
+# Sub-phase 5C: Training & Evaluation
+# ══════════════════════════════════════════════════════════════════════
 
-print("\n=== Phase 2 & 3 Complete: Structural Features + NCN Architecture ===")
-
-
+# ── Training Utilities ────────────────────────────────────────────────
 
 def get_edge_metadata(data, edge_index):
+    """Extract tissue types and intra/inter-slice flag for each edge."""
     src_tissue = data.tissue_labels[edge_index[0]]
     dst_tissue = data.tissue_labels[edge_index[1]]
     is_inter = (data.slice_ids[edge_index[0]] != data.slice_ids[edge_index[1]]).long()
@@ -548,6 +486,7 @@ def get_edge_metadata(data, edge_index):
 
 
 def degree_biased_negative_sampling(data, num_neg):
+    """Sample negative edges biased toward high-degree nodes (harder negatives)."""
     num_nodes = data.x.size(0)
     if num_nodes < 2:
         return torch.zeros(2, 0, dtype=torch.long)
@@ -579,154 +518,109 @@ def degree_biased_negative_sampling(data, num_neg):
     return torch.tensor([neg_src, neg_dst], dtype=torch.long)
 
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=GNN_CONFIG["gnn_lr"], weight_decay=GNN_CONFIG["gnn_weight_decay"])
-scheduler = torch.optim.lr_scheduler.OneCycleLR(
-    optimizer,
-    max_lr=GNN_CONFIG["gnn_lr"],
-    total_steps=GNN_CONFIG["gnn_epochs"] * len(train_graphs),
-)
+# ── Training Loop ────────────────────────────────────────────────────
 
-best_val_auc = 0.0
-best_model_path = GNN_CONFIG["brats_output_dir"] / "best_gnn.pt"
+def train_gnn(model, train_graphs, val_graphs, config=None):
+    """Full GNN training loop with per-graph forward/backward."""
+    config = config or GNN
+    device = SHARED["device"]
+    sf_computer = StructuralFeatureComputer()
 
-print(f"\nStarting GNN training for {GNN_CONFIG['gnn_epochs']} epochs on {len(train_graphs)} train graphs...")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"],
+    )
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=config["lr"],
+        total_steps=config["epochs"] * len(train_graphs),
+    )
 
-for epoch in range(GNN_CONFIG["gnn_epochs"]):
-    model.train()
-    epoch_loss = 0.0
-    graphs_trained = 0
+    best_val_auc = 0.0
+    checkpoint_path = config["checkpoint"]
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for g in train_graphs:
-        if g.edge_index.size(1) < 2 or g.x.size(0) < 3:
-            continue
+    print(f"\nTraining GNN for {config['epochs']} epochs on {len(train_graphs)} graphs...")
 
-        data = g.to(GNN_CONFIG["device"])
-        pos_ei = data.edge_index
-        num_pos = pos_ei.size(1)
+    for epoch in range(config["epochs"]):
+        model.train()
+        epoch_loss, graphs_trained = 0.0, 0
 
-        neg_ei = degree_biased_negative_sampling(g, num_pos).to(GNN_CONFIG["device"])
-        if neg_ei.size(1) == 0:
-            continue
+        for g in train_graphs:
+            if g.edge_index.size(1) < 2 or g.x.size(0) < 3:
+                continue
 
-        pos_sf, pos_cn = sf_computer.compute(g.edge_index, g.x.size(0), pos_ei)
-        neg_sf, neg_cn = sf_computer.compute(g.edge_index, g.x.size(0), neg_ei)
+            data = g.to(device)
+            pos_ei = data.edge_index
+            neg_ei = degree_biased_negative_sampling(g, pos_ei.size(1)).to(device)
+            if neg_ei.size(1) == 0:
+                continue
 
-        pos_src_t, pos_dst_t, pos_inter = get_edge_metadata(g, pos_ei)
-        neg_src_t, neg_dst_t, neg_inter = get_edge_metadata(g, neg_ei)
+            pos_sf, pos_cn = sf_computer.compute(g.edge_index, g.x.size(0), pos_ei)
+            neg_sf, neg_cn = sf_computer.compute(g.edge_index, g.x.size(0), neg_ei)
+            pos_src_t, pos_dst_t, pos_inter = get_edge_metadata(g, pos_ei)
+            neg_src_t, neg_dst_t, neg_inter = get_edge_metadata(g, neg_ei)
 
-        pos_pred, neg_pred, z, _ = model(
-            data, pos_ei, neg_ei,
-            pos_sf, neg_sf, pos_cn, neg_cn,
-            pos_src_t.to(GNN_CONFIG["device"]), pos_dst_t.to(GNN_CONFIG["device"]),
-            neg_src_t.to(GNN_CONFIG["device"]), neg_dst_t.to(GNN_CONFIG["device"]),
-            pos_inter.to(GNN_CONFIG["device"]), neg_inter.to(GNN_CONFIG["device"]),
-        )
-
-        pos_loss = F.binary_cross_entropy_with_logits(pos_pred, torch.ones_like(pos_pred))
-        neg_loss = F.binary_cross_entropy_with_logits(neg_pred, torch.zeros_like(neg_pred))
-        loss = pos_loss + neg_loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
-
-        epoch_loss += loss.item()
-        graphs_trained += 1
-
-    avg_loss = epoch_loss / max(graphs_trained, 1)
-
-    if (epoch + 1) % 10 == 0 or epoch == 0:
-        model.eval()
-        all_labels, all_scores = [], []
-        inter_labels, inter_scores = [], []
-        intra_labels, intra_scores = [], []
-
-        with torch.no_grad():
-            for g in val_graphs:
-                if g.edge_index.size(1) < 2 or g.x.size(0) < 3:
-                    continue
-
-                data = g.to(GNN_CONFIG["device"])
-                pos_ei = data.edge_index
-                neg_ei = degree_biased_negative_sampling(g, pos_ei.size(1)).to(GNN_CONFIG["device"])
-                if neg_ei.size(1) == 0:
-                    continue
-
-                pos_sf, pos_cn = sf_computer.compute(g.edge_index, g.x.size(0), pos_ei)
-                neg_sf, neg_cn = sf_computer.compute(g.edge_index, g.x.size(0), neg_ei)
-                pos_src_t, pos_dst_t, pos_inter = get_edge_metadata(g, pos_ei)
-                neg_src_t, neg_dst_t, neg_inter = get_edge_metadata(g, neg_ei)
-
-                pos_pred, neg_pred, _, _ = model(
-                    data, pos_ei, neg_ei,
-                    pos_sf, neg_sf, pos_cn, neg_cn,
-                    pos_src_t.to(GNN_CONFIG["device"]), pos_dst_t.to(GNN_CONFIG["device"]),
-                    neg_src_t.to(GNN_CONFIG["device"]), neg_dst_t.to(GNN_CONFIG["device"]),
-                    pos_inter.to(GNN_CONFIG["device"]), neg_inter.to(GNN_CONFIG["device"]),
-                )
-
-                pos_s = torch.sigmoid(pos_pred).cpu().numpy()
-                neg_s = torch.sigmoid(neg_pred).cpu().numpy()
-                all_scores.extend(pos_s.tolist() + neg_s.tolist())
-                all_labels.extend([1] * len(pos_s) + [0] * len(neg_s))
-
-                for i, s in enumerate(pos_s):
-                    if pos_inter[i].item() == 1:
-                        inter_scores.append(s)
-                        inter_labels.append(1)
-                    else:
-                        intra_scores.append(s)
-                        intra_labels.append(1)
-                for i, s in enumerate(neg_s):
-                    if neg_inter[i].item() == 1:
-                        inter_scores.append(s)
-                        inter_labels.append(0)
-                    else:
-                        intra_scores.append(s)
-                        intra_labels.append(0)
-
-        if len(set(all_labels)) > 1:
-            auc = roc_auc_score(all_labels, all_scores)
-            ap = average_precision_score(all_labels, all_scores)
-            inter_auc = roc_auc_score(inter_labels, inter_scores) if len(set(inter_labels)) > 1 else 0.0
-            intra_auc = roc_auc_score(intra_labels, intra_scores) if len(set(intra_labels)) > 1 else 0.0
-
-            print(
-                f"Epoch {epoch+1:3d}/{GNN_CONFIG['gnn_epochs']} | "
-                f"Loss: {avg_loss:.4f} | AUC: {auc:.4f} | AP: {ap:.4f} | "
-                f"Intra-AUC: {intra_auc:.4f} | Inter-AUC: {inter_auc:.4f}"
+            pos_pred, neg_pred, z, _ = model(
+                data, pos_ei, neg_ei,
+                pos_sf, neg_sf, pos_cn, neg_cn,
+                pos_src_t.to(device), pos_dst_t.to(device),
+                neg_src_t.to(device), neg_dst_t.to(device),
+                pos_inter.to(device), neg_inter.to(device),
             )
 
-            if auc > best_val_auc:
-                best_val_auc = auc
-                torch.save(model.state_dict(), str(best_model_path))
-                print(f"  -> Best model saved (AUC: {auc:.4f})")
+            loss = (
+                F.binary_cross_entropy_with_logits(pos_pred, torch.ones_like(pos_pred)) +
+                F.binary_cross_entropy_with_logits(neg_pred, torch.zeros_like(neg_pred))
+            )
 
-print(f"\nTraining complete. Best val AUC: {best_val_auc:.4f}")
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+
+            epoch_loss += loss.item()
+            graphs_trained += 1
+
+        avg_loss = epoch_loss / max(graphs_trained, 1)
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            metrics = evaluate_gnn(model, val_graphs, sf_computer)
+            if metrics["auc"] is not None:
+                print(
+                    f"Epoch {epoch+1:3d}/{config['epochs']} | "
+                    f"Loss: {avg_loss:.4f} | AUC: {metrics['auc']:.4f} | AP: {metrics['ap']:.4f} | "
+                    f"Intra: {metrics['intra_auc']:.4f} | Inter: {metrics['inter_auc']:.4f}"
+                )
+                if metrics["auc"] > best_val_auc:
+                    best_val_auc = metrics["auc"]
+                    torch.save(model.state_dict(), str(checkpoint_path))
+                    print(f"  -> Best model saved (AUC: {metrics['auc']:.4f})")
+
+    print(f"Training complete. Best val AUC: {best_val_auc:.4f}")
+    return best_val_auc
 
 
+# ── Evaluation ───────────────────────────────────────────────────────
 
-print("\n=== Phase 5: Reasoning Traces & Visualization ===")
+@torch.no_grad()
+def evaluate_gnn(model, graphs, sf_computer=None):
+    """Evaluate GNN on a set of graphs. Returns overall/intra/inter AUC + tissue-pair scores."""
+    model.eval()
+    sf_computer = sf_computer or StructuralFeatureComputer()
+    device = SHARED["device"]
 
-model.load_state_dict(torch.load(str(best_model_path), weights_only=True))
-model.eval()
+    all_labels, all_scores = [], []
+    inter_labels, inter_scores = [], []
+    intra_labels, intra_scores = [], []
+    tissue_pair_scores = defaultdict(list)
 
-test_auc_all, test_ap_all = [], []
-test_auc_inter, test_auc_intra = [], []
-tissue_pair_scores = defaultdict(list)
-
-all_test_labels, all_test_scores = [], []
-
-with torch.no_grad():
-    for g in test_graphs:
+    for g in graphs:
         if g.edge_index.size(1) < 2 or g.x.size(0) < 3:
             continue
 
-        data = g.to(GNN_CONFIG["device"])
+        data = g.to(device)
         pos_ei = data.edge_index
-        neg_ei = degree_biased_negative_sampling(g, pos_ei.size(1)).to(GNN_CONFIG["device"])
+        neg_ei = degree_biased_negative_sampling(g, pos_ei.size(1)).to(device)
         if neg_ei.size(1) == 0:
             continue
 
@@ -735,46 +629,66 @@ with torch.no_grad():
         pos_src_t, pos_dst_t, pos_inter = get_edge_metadata(g, pos_ei)
         neg_src_t, neg_dst_t, neg_inter = get_edge_metadata(g, neg_ei)
 
-        pos_pred, neg_pred, z, _ = model(
+        pos_pred, neg_pred, _, _ = model(
             data, pos_ei, neg_ei,
             pos_sf, neg_sf, pos_cn, neg_cn,
-            pos_src_t.to(GNN_CONFIG["device"]), pos_dst_t.to(GNN_CONFIG["device"]),
-            neg_src_t.to(GNN_CONFIG["device"]), neg_dst_t.to(GNN_CONFIG["device"]),
-            pos_inter.to(GNN_CONFIG["device"]), neg_inter.to(GNN_CONFIG["device"]),
+            pos_src_t.to(device), pos_dst_t.to(device),
+            neg_src_t.to(device), neg_dst_t.to(device),
+            pos_inter.to(device), neg_inter.to(device),
         )
 
         pos_s = torch.sigmoid(pos_pred).cpu().numpy()
         neg_s = torch.sigmoid(neg_pred).cpu().numpy()
-        labels = [1] * len(pos_s) + [0] * len(neg_s)
-        scores = pos_s.tolist() + neg_s.tolist()
-        all_test_labels.extend(labels)
-        all_test_scores.extend(scores)
+        all_scores.extend(pos_s.tolist() + neg_s.tolist())
+        all_labels.extend([1] * len(pos_s) + [0] * len(neg_s))
 
-        if len(set(labels)) > 1:
-            test_auc_all.append(roc_auc_score(labels, scores))
-            test_ap_all.append(average_precision_score(labels, scores))
+        for i, s in enumerate(pos_s):
+            if pos_inter[i].item() == 1:
+                inter_scores.append(s)
+                inter_labels.append(1)
+            else:
+                intra_scores.append(s)
+                intra_labels.append(1)
+        for i, s in enumerate(neg_s):
+            if neg_inter[i].item() == 1:
+                inter_scores.append(s)
+                inter_labels.append(0)
+            else:
+                intra_scores.append(s)
+                intra_labels.append(0)
 
         for i in range(len(pos_s)):
-            src_t = GNN_CONFIG["tissue_labels"][pos_src_t[i].item()]
-            dst_t = GNN_CONFIG["tissue_labels"][pos_dst_t[i].item()]
-            pair = f"{src_t}→{dst_t}"
-            tissue_pair_scores[pair].append(float(pos_s[i]))
+            src_t = GNN["tissue_labels"][pos_src_t[i].item()]
+            dst_t = GNN["tissue_labels"][pos_dst_t[i].item()]
+            tissue_pair_scores[f"{src_t}→{dst_t}"].append(float(pos_s[i]))
 
-print(f"\nTest Results:")
-print(f"  AUC-ROC: {np.mean(test_auc_all):.4f} ± {np.std(test_auc_all):.4f}")
-print(f"  AP:      {np.mean(test_ap_all):.4f} ± {np.std(test_ap_all):.4f}")
-print(f"\nTissue-pair mean confidence:")
-for pair, scores in sorted(tissue_pair_scores.items(), key=lambda x: -np.mean(x[1])):
-    print(f"  {pair}: {np.mean(scores):.3f} (n={len(scores)})")
+    if len(set(all_labels)) < 2:
+        return {"auc": None, "ap": None, "intra_auc": None, "inter_auc": None,
+                "tissue_pairs": {}, "all_labels": all_labels, "all_scores": all_scores}
 
+    return {
+        "auc": roc_auc_score(all_labels, all_scores),
+        "ap": average_precision_score(all_labels, all_scores),
+        "intra_auc": roc_auc_score(intra_labels, intra_scores) if len(set(intra_labels)) > 1 else 0.0,
+        "inter_auc": roc_auc_score(inter_labels, inter_scores) if len(set(inter_labels)) > 1 else 0.0,
+        "tissue_pairs": dict(tissue_pair_scores),
+        "all_labels": all_labels,
+        "all_scores": all_scores,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Sub-phase 5D: Reasoning Traces & Visualization
+# ══════════════════════════════════════════════════════════════════════
 
 class ReasoningTraceGenerator:
-    def __init__(self, config, tissue_labels):
-        self.config = config
-        self.tissue_labels = tissue_labels
+    """Generate human-readable 3D reasoning traces for top-k edges."""
+
+    def __init__(self, tissue_labels=None):
+        self.tissue_labels = tissue_labels or GNN["tissue_labels"]
 
     def generate(self, data, z, pos_pred, sf, cn_list, src_tissue, dst_tissue, is_inter, top_k=10):
-        scores = torch.sigmoid(pos_pred).cpu().numpy()
+        scores = torch.sigmoid(pos_pred).detach().cpu().numpy()
         top_indices = np.argsort(scores)[::-1][:top_k]
         traces = []
 
@@ -800,7 +714,6 @@ class ReasoningTraceGenerator:
             dst_feats = data.x[j]
             src_t1c_mean = src_feats[15].item()
             dst_t1c_mean = dst_feats[15].item()
-            src_t2f_mean = dst_feats[23].item()
 
             trace = (
                 f"Edge ({i}→{j}): {'strong' if conf > 0.7 else 'moderate' if conf > 0.4 else 'weak'} "
@@ -820,42 +733,46 @@ class ReasoningTraceGenerator:
         return traces
 
 
-trace_gen = ReasoningTraceGenerator(GNN_CONFIG, GNN_CONFIG["tissue_labels"])
+# ── Visualization ─────────────────────────────────────────────────────
 
-demo_graph = None
-for g in test_graphs:
-    if g.edge_index.size(1) >= 10 and g.x.size(0) >= 5:
-        demo_graph = g
-        break
-if demo_graph is None and len(test_graphs) > 0:
-    demo_graph = test_graphs[0]
+def plot_3d_graphs(graphs, n=3):
+    """3D scatter plot of tumor graphs with inter-slice edges highlighted."""
+    fig = plt.figure(figsize=(18, 6))
+    for plot_idx in range(min(n, len(graphs))):
+        g = graphs[plot_idx]
+        if g.edge_index.size(1) == 0:
+            continue
+        ax = fig.add_subplot(1, n, plot_idx + 1, projection='3d')
+        pos = g.pos.numpy()
+        tl = g.tissue_labels.numpy()
+        colors = {1: 'red', 2: 'green', 3: 'gold'}
+        for tissue in [1, 2, 3]:
+            mask = tl == tissue
+            if mask.sum() > 0:
+                ax.scatter(pos[mask, 0], pos[mask, 1], pos[mask, 2],
+                           c=colors[tissue], s=40, alpha=0.8,
+                           label=GNN["tissue_labels"][tissue])
+        ei = g.edge_index.numpy()
+        for e in range(ei.shape[1]):
+            si, di = ei[0, e], ei[1, e]
+            is_inter = g.slice_ids[si].item() != g.slice_ids[di].item()
+            color = 'blue' if is_inter else 'gray'
+            alpha = 0.6 if is_inter else 0.15
+            ax.plot([pos[si, 0], pos[di, 0]], [pos[si, 1], pos[di, 1]],
+                    [pos[si, 2], pos[di, 2]], color=color, alpha=alpha, linewidth=0.5)
+        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Slice")
+        ax.set_title(f"{g.case_id[-7:]} | {g.x.size(0)} nodes", fontsize=9)
+        ax.legend(fontsize=7)
+    plt.suptitle("3D Tumor Graphs (blue=inter-slice, gray=intra-slice)", fontsize=13)
+    plt.tight_layout()
+    plt.show()
 
-if demo_graph is not None and demo_graph.edge_index.size(1) >= 2:
-    data = demo_graph.to(GNN_CONFIG["device"])
-    pos_ei = data.edge_index
-    pos_sf, pos_cn = sf_computer.compute(demo_graph.edge_index, demo_graph.x.size(0), pos_ei)
-    pos_src_t, pos_dst_t, pos_inter = get_edge_metadata(demo_graph, pos_ei)
 
-    z, alphas = model.encode(data, return_attention=True)
-    pos_pred = model.decode(
-        z, pos_ei, pos_sf, pos_cn,
-        pos_src_t.to(GNN_CONFIG["device"]),
-        pos_dst_t.to(GNN_CONFIG["device"]),
-        pos_inter.to(GNN_CONFIG["device"]),
-    )
-
-    traces = trace_gen.generate(
-        demo_graph, z, pos_pred, pos_sf, pos_cn,
-        pos_src_t, pos_dst_t, pos_inter, top_k=8,
-    )
-
-    print(f"\n--- Reasoning Traces for {demo_graph.case_id} ---")
-    for t in traces:
-        print(t)
-        print()
-
+def plot_results(demo_graph, pos_pred, tissue_pair_scores, all_labels, all_scores):
+    """3-panel visualization: slice overlay, tissue-pair bars, ROC curve."""
     fig, axes = plt.subplots(1, 3, figsize=(20, 6))
 
+    # Panel 1: slice graph overlay
     ax = axes[0]
     unique_slices = sorted(demo_graph.slice_ids.unique().numpy())
     mid_slice = unique_slices[len(unique_slices) // 2]
@@ -867,8 +784,8 @@ if demo_graph is not None and demo_graph.edge_index.size(1) >= 2:
         m = node_mask & (tl == tissue)
         if m.sum() > 0:
             ax.scatter(pos[m, 0], pos[m, 1], c=colors[tissue], s=80, alpha=0.9,
-                       label=GNN_CONFIG["tissue_labels"][tissue], edgecolors='black', linewidths=0.5)
-    pred_scores = torch.sigmoid(pos_pred).cpu().numpy()
+                       label=GNN["tissue_labels"][tissue], edgecolors='black', linewidths=0.5)
+    pred_scores = torch.sigmoid(pos_pred).detach().cpu().numpy()
     ei = demo_graph.edge_index.numpy()
     for e in range(ei.shape[1]):
         si, di = ei[0, e], ei[1, e]
@@ -881,10 +798,9 @@ if demo_graph is not None and demo_graph.edge_index.size(1) >= 2:
     ax.legend(fontsize=8)
     ax.set_aspect('equal')
 
+    # Panel 2: tissue-pair confidence
     ax2 = axes[1]
-    pair_means = {}
-    for pair, scores in tissue_pair_scores.items():
-        pair_means[pair] = np.mean(scores)
+    pair_means = {p: np.mean(s) for p, s in tissue_pair_scores.items()}
     if pair_means:
         pairs = list(pair_means.keys())
         vals = [pair_means[p] for p in pairs]
@@ -894,11 +810,12 @@ if demo_graph is not None and demo_graph.edge_index.size(1) >= 2:
         ax2.set_title("Tissue-Pair Link Confidence", fontsize=10)
         ax2.set_xlim(0, 1)
 
+    # Panel 3: ROC curve
     ax3 = axes[2]
-    if len(all_test_labels) > 0:
+    if len(all_labels) > 0 and len(set(all_labels)) > 1:
         from sklearn.metrics import roc_curve
-        fpr, tpr, _ = roc_curve(all_test_labels, all_test_scores)
-        overall_auc = roc_auc_score(all_test_labels, all_test_scores)
+        fpr, tpr, _ = roc_curve(all_labels, all_scores)
+        overall_auc = roc_auc_score(all_labels, all_scores)
         ax3.plot(fpr, tpr, 'b-', linewidth=2, label=f"AUC = {overall_auc:.3f}")
         ax3.plot([0, 1], [0, 1], 'k--', alpha=0.3)
         ax3.set_xlabel("FPR")
@@ -910,4 +827,78 @@ if demo_graph is not None and demo_graph.edge_index.size(1) >= 2:
     plt.tight_layout()
     plt.show()
 
-print("\n=== BraTS 3D GNN Pipeline Complete ===")
+
+# ── Main ──────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    from config import ensure_dirs
+    ensure_dirs()
+
+    print(f"Device: {SHARED['device']}")
+
+    # Build graphs
+    train_graphs, val_graphs, test_graphs = build_all_graphs()
+
+    # Visualize
+    plot_3d_graphs(train_graphs)
+
+    # Model
+    model = NCNEdgePredictor().to(SHARED["device"])
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"NCNEdgePredictor | Parameters: {total_params:,}")
+
+    # Train
+    train_gnn(model, train_graphs, val_graphs)
+
+    # Test
+    model.load_state_dict(torch.load(str(GNN["checkpoint"]), weights_only=True))
+    sf_computer = StructuralFeatureComputer()
+    test_metrics = evaluate_gnn(model, test_graphs, sf_computer)
+
+    print(f"\nTest Results:")
+    print(f"  AUC-ROC: {test_metrics['auc']:.4f}")
+    print(f"  AP:      {test_metrics['ap']:.4f}")
+    print(f"  Intra:   {test_metrics['intra_auc']:.4f}")
+    print(f"  Inter:   {test_metrics['inter_auc']:.4f}")
+    print(f"\nTissue-pair confidence:")
+    for pair, scores in sorted(test_metrics["tissue_pairs"].items(), key=lambda x: -np.mean(x[1])):
+        print(f"  {pair}: {np.mean(scores):.3f} (n={len(scores)})")
+
+    # Reasoning traces on a demo graph
+    demo_graph = None
+    for g in test_graphs:
+        if g.edge_index.size(1) >= 10 and g.x.size(0) >= 5:
+            demo_graph = g
+            break
+    if demo_graph is None and len(test_graphs) > 0:
+        demo_graph = test_graphs[0]
+
+    if demo_graph is not None and demo_graph.edge_index.size(1) >= 2:
+        data = demo_graph.to(SHARED["device"])
+        pos_ei = data.edge_index
+        pos_sf, pos_cn = sf_computer.compute(demo_graph.edge_index, demo_graph.x.size(0), pos_ei)
+        pos_src_t, pos_dst_t, pos_inter = get_edge_metadata(demo_graph, pos_ei)
+
+        z, alphas = model.encode(data, return_attention=True)
+        pos_pred = model.decode(
+            z, pos_ei, pos_sf, pos_cn,
+            pos_src_t.to(SHARED["device"]),
+            pos_dst_t.to(SHARED["device"]),
+            pos_inter.to(SHARED["device"]),
+        )
+
+        trace_gen = ReasoningTraceGenerator()
+        traces = trace_gen.generate(
+            demo_graph, z, pos_pred, pos_sf, pos_cn,
+            pos_src_t, pos_dst_t, pos_inter, top_k=8,
+        )
+
+        print(f"\n--- Reasoning Traces for {demo_graph.case_id} ---")
+        for t in traces:
+            print(t)
+            print()
+
+        plot_results(demo_graph, pos_pred, test_metrics["tissue_pairs"],
+                     test_metrics["all_labels"], test_metrics["all_scores"])
+
+    print("\n=== BraTS 3D GNN Pipeline Complete ===")

@@ -62,8 +62,37 @@ def zscore_normalize(volume):
 
 
 def extract_and_save_slices(case, cache_dir, config=None):
-    """Extract 2D tumor slices from a case and save to disk."""
+    """Extract 2D tumor slices from a case and save to disk.
+
+    Skips extraction if cached slices from a previous run are found.
+    """
     config = config or SEGMENTATION
+
+    # Check cache: look for existing slices for this case
+    prefix = f"{case['case_id']}_s"
+    existing = sorted(cache_dir.glob(f"{prefix}*_img.npy"))
+    if existing:
+        saved = []
+        for img_path in existing:
+            # Reconstruct metadata from filename: {case_id}_s{idx:03d}_img.npy
+            stem = img_path.stem  # e.g. "BraTS-GLI-00000-000_s045_img"
+            mask_path = img_path.parent / stem.replace("_img", "_mask").replace(stem, stem.replace("_img", "_mask"))
+            # Simpler: just swap suffix
+            mask_path = cache_dir / (stem.replace("_img", "_mask") + ".npy")
+            if mask_path.exists():
+                # Parse slice index from filename
+                s_part = stem.split("_s")[-1].replace("_img", "")
+                slice_idx = int(s_part)
+                saved.append({
+                    "img_path": str(img_path),
+                    "mask_path": str(mask_path),
+                    "case_id": case["case_id"],
+                    "slice_idx": slice_idx,
+                })
+        if saved:
+            return saved
+
+    # No cache — extract from NIfTI volumes
     seg_vol = load_volume(case["files"]["seg"])
     modality_vols = {}
     for mod in config["modalities"]:
@@ -149,13 +178,18 @@ def prepare_data(config=None):
     cases = discover_cases(config["data_root"])
     print(f"Discovered {len(cases)} valid BraTS cases")
 
-    print("Extracting 2D slices to disk...")
+    print("Extracting 2D slices (cached slices reused if found)...")
     all_meta = []
+    cached_count = 0
     for i, case in enumerate(cases):
+        prefix = f"{case['case_id']}_s"
+        was_cached = len(list(cache_dir.glob(f"{prefix}*_img.npy"))) > 0
         case_meta = extract_and_save_slices(case, cache_dir, config)
         all_meta.extend(case_meta)
+        if was_cached:
+            cached_count += 1
         if (i + 1) % 50 == 0 or i == 0 or i == len(cases) - 1:
-            print(f"  Processed {i+1}/{len(cases)} cases | Total slices: {len(all_meta)}")
+            print(f"  Processed {i+1}/{len(cases)} cases | Total slices: {len(all_meta)} | Cached: {cached_count}")
 
     print(f"Total slices extracted: {len(all_meta)}")
 

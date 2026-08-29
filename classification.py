@@ -104,14 +104,16 @@ class GradCAM:
     def generate(self, input_tensor, target_class=None):
         """Generate CAM heatmaps for a batch of inputs."""
         self.model.eval()
-        output = self.model(input_tensor)
-        if target_class is None:
-            target_class = output.argmax(dim=1)
-        self.model.zero_grad()
-        one_hot = torch.zeros_like(output)
-        for i in range(len(target_class)):
-            one_hot[i, target_class[i]] = 1.0
-        output.backward(gradient=one_hot)
+        input_tensor = input_tensor.requires_grad_(True)
+        with torch.enable_grad():
+            output = self.model(input_tensor)
+            if target_class is None:
+                target_class = output.argmax(dim=1)
+            self.model.zero_grad()
+            one_hot = torch.zeros_like(output)
+            for i in range(len(target_class)):
+                one_hot[i, target_class[i]] = 1.0
+            output.backward(gradient=one_hot)
         weights = self.gradients.mean(dim=(2, 3), keepdim=True)
         cam = (weights * self.activations).sum(dim=1, keepdim=True)
         cam = F.relu(cam)

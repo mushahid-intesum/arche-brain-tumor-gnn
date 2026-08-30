@@ -1,9 +1,10 @@
 """
 Phase 4: Hierarchical Supervoxel-Segmentation GNN
-NCN (Neural Common Neighbor) architecture with:
-  - SVGFormer-inspired supervoxel intra-node aggregation
-  - OCN-enhanced structural features
-  - Tissue-aware edge decoder
+OCN (Orthogonalized Common Neighbor) architecture with:
+  - SVGFormer-inspired supervoxel intra-node aggregation (IntraNodeAggregator)
+  - GATv2 encoder with residual connections
+  - OCN-enhanced structural features (StructuralFeatureComputer)
+  - Multi-signal tissue-aware edge decoder
 Input: brats_outputs/ (3D volumes + predicted masks from segmentation pipeline)
 """
 
@@ -12,10 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
-import cv2
-import random
-import networkx as nx
-from pathlib import Path
 from collections import defaultdict
 from torch_geometric.data import Data
 from torch_geometric.utils import to_undirected
@@ -28,228 +25,8 @@ from supervoxel import process_case_supervoxels
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Sub-phase 5A: Feature Extraction & Graph Construction
+# Hierarchical Graph Construction & Feature Extraction
 # ══════════════════════════════════════════════════════════════════════
-
-# ── Feature Extractors ────────────────────────────────────────────────
-
-def compute_region_raw_features(raw_4ch, component_mask):
-    """Per-modality intensity stats: mean, std, range, skewness (4 × 4 = 16 dims)."""
-    feats = []
-    for ch in range(4):
-        pixels = raw_4ch[ch][component_mask == 1]
-        if len(pixels) == 0:
-            feats.extend([0.0, 0.0, 0.0, 0.0])
-            continue
-        m = float(np.mean(pixels))
-        s = float(np.std(pixels))
-        r = float(np.max(pixels) - np.min(pixels))
-        sk = float(np.mean(((pixels - m) / max(s, 1e-8)) ** 3))
-        feats.extend([m, s, r, sk])
-    return feats
-
-
-def compute_boundary_features(raw_4ch, component_mask):
-    """Gradient magnitude at boundary + texture contrast (2 dims)."""
-    t1c = raw_4ch[1]
-    dilated = cv2.dilate(component_mask, np.ones((3, 3), np.uint8), iterations=1)
-    boundary = dilated - component_mask
-    if boundary.sum() > 0 and component_mask.sum() > 0:
-        inner = t1c[component_mask == 1].mean()
-        outer = t1c[boundary == 1].mean()
-        grad = float(abs(inner - outer))
-    else:
-        grad = 0.0
-    kernel = np.ones((3, 3), dtype=np.float32) / 9.0
-    local_mean = cv2.filter2D(t1c, -1, kernel)
-    local_var = cv2.filter2D((t1c - local_mean) ** 2, -1, kernel)
-    texture = float(np.mean(local_var[component_mask == 1])) if component_mask.sum() > 0 else 0.0
-    return [grad, texture]
-
-
-def compute_crossmodal_features(raw_4ch, component_mask):
-    """Cross-modal ratios: enhancement, edema signal, diffs (4 dims)."""
-    if component_mask.sum() == 0:
-        return [0.0, 0.0, 0.0, 0.0]
-    means = []
-    for ch in range(4):
-        means.append(float(np.mean(raw_4ch[ch][component_mask == 1])))
-    t1n_m, t1c_m, t2w_m, t2f_m = means
-    enhancement = t1c_m / max(t1n_m, 1e-8)
-    edema_sig = t2w_m / max(t2f_m, 1e-8)
-    t1c_t2w_diff = t1c_m - t2w_m
-    flair_t2w_diff = t2f_m - t2w_m
-    return [enhancement, edema_sig, t1c_t2w_diff, flair_t2w_diff]
-
-
-# ── Region Extraction ─────────────────────────────────────────────────
-
-def extract_regions_multiclass(mask_np, raw_4ch, slice_idx, total_slices, config=None):
-    """Extract connected components per tissue type → node features (35-dim)."""
-    config = config or GNN
-    regions = []
-    img_size = SHARED["img_size"]
-    tumor_area = float((mask_np > 0).sum())
-    tumor_ratio = tumor_area / (img_size * img_size)
-    z_norm = slice_idx / max(total_slices, 1)
-
-    for tissue_label in [1, 2, 3]:
-        binary = (mask_np == tissue_label).astype(np.uint8)
-        if binary.sum() < config["min_region_area"]:
-            continue
-
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            binary * 255, connectivity=8
-        )
-
-        for label_id in range(1, num_labels):
-            area = stats[label_id, cv2.CC_STAT_AREA]
-            if area < config["min_region_area"]:
-                continue
-
-            cx, cy = centroids[label_id]
-            w = stats[label_id, cv2.CC_STAT_WIDTH]
-            h = stats[label_id, cv2.CC_STAT_HEIGHT]
-            component_mask = (labels == label_id).astype(np.uint8)
-            bbox_area = max(w * h, 1)
-            solidity = area / bbox_area
-            aspect_ratio = w / max(h, 1)
-
-            tissue_onehot = [0.0, 0.0, 0.0]
-            tissue_onehot[tissue_label - 1] = 1.0
-
-            raw_feats = compute_region_raw_features(raw_4ch, component_mask)
-            boundary_feats = compute_boundary_features(raw_4ch, component_mask)
-            crossmodal_feats = compute_crossmodal_features(raw_4ch, component_mask)
-
-            feat = [
-                cx / img_size, cy / img_size, z_norm,           # 3D position (3)
-                area / (img_size * img_size), w / img_size,     # morphology (5)
-                h / img_size, aspect_ratio, solidity,
-            ] + tissue_onehot + raw_feats + boundary_feats + crossmodal_feats + [
-                z_norm, tumor_ratio,                             # slice context (2)
-            ]
-
-            regions.append({
-                "features": feat,
-                "centroid_2d": (cx, cy),
-                "slice_idx": slice_idx,
-                "tissue_label": tissue_label,
-            })
-
-    return regions
-
-
-# ── 3D Graph Construction ────────────────────────────────────────────
-
-def build_3d_graph(case_id, slice_list, config=None):
-    """Build a single 3D volumetric graph for one patient."""
-    config = config or GNN
-    all_regions = []
-    total_slices = max(s["slice_idx"] for s in slice_list) - min(s["slice_idx"] for s in slice_list) + 1
-
-    for s_info in slice_list:
-        mask = np.load(str(s_info["mask_file"]))
-        raw = np.load(str(s_info["raw_file"]))
-        regions = extract_regions_multiclass(mask, raw, s_info["slice_idx"], total_slices, config)
-        all_regions.extend(regions)
-
-    if len(all_regions) < 2:
-        x = torch.randn(max(len(all_regions), 1), config["node_feat_dim"])
-        return Data(
-            x=x,
-            edge_index=torch.zeros(2, 0, dtype=torch.long),
-            pos=torch.tensor([[0.5, 0.5, 0.5]]),
-            edge_attr=torch.zeros(0, config["edge_attr_dim"]),
-        )
-
-    x = torch.tensor([r["features"] for r in all_regions], dtype=torch.float32)
-    pos_2d = torch.tensor([list(r["centroid_2d"]) for r in all_regions], dtype=torch.float32)
-    slice_ids = torch.tensor([r["slice_idx"] for r in all_regions], dtype=torch.long)
-    tissue_labels = torch.tensor([r["tissue_label"] for r in all_regions], dtype=torch.long)
-    pos_3d = torch.cat([pos_2d, slice_ids.unsqueeze(1).float()], dim=1)
-
-    slice_to_nodes = defaultdict(list)
-    for i, r in enumerate(all_regions):
-        slice_to_nodes[r["slice_idx"]].append(i)
-
-    # Intra-slice edges: KNN within each slice
-    intra_src, intra_dst = [], []
-    for s_idx, node_ids in slice_to_nodes.items():
-        if len(node_ids) < 2:
-            continue
-        local_pos = pos_2d[node_ids]
-        k = min(config["k_neighbors"], len(node_ids) - 1)
-        if k < 1:
-            continue
-        local_ei = knn_graph(local_pos, k=k, loop=False)
-        for e in range(local_ei.size(1)):
-            intra_src.append(node_ids[local_ei[0, e].item()])
-            intra_dst.append(node_ids[local_ei[1, e].item()])
-
-    # Inter-slice edges: spatially close + tissue compatible across adjacent slices
-    inter_src, inter_dst = [], []
-    sorted_slices = sorted(slice_to_nodes.keys())
-    for idx in range(len(sorted_slices) - 1):
-        s_curr = sorted_slices[idx]
-        s_next = sorted_slices[idx + 1]
-        if s_next - s_curr > 2:
-            continue
-        for ni in slice_to_nodes[s_curr]:
-            for nj in slice_to_nodes[s_next]:
-                dx = pos_2d[ni, 0] - pos_2d[nj, 0]
-                dy = pos_2d[ni, 1] - pos_2d[nj, 1]
-                dist = float(torch.sqrt(dx ** 2 + dy ** 2))
-                if dist > config["inter_slice_dist_thresh"]:
-                    continue
-                ti = tissue_labels[ni].item()
-                tj = tissue_labels[nj].item()
-                compatible = (ti == tj) or (abs(ti - tj) <= 1) or ({ti, tj} == {1, 3})
-                if compatible:
-                    inter_src.extend([ni, nj])
-                    inter_dst.extend([nj, ni])
-
-    all_src = intra_src + inter_src
-    all_dst = intra_dst + inter_dst
-
-    if len(all_src) == 0:
-        edge_index = torch.zeros(2, 0, dtype=torch.long)
-        edge_attr = torch.zeros(0, config["edge_attr_dim"])
-    else:
-        edge_index = torch.tensor([all_src, all_dst], dtype=torch.long)
-        edge_index = to_undirected(edge_index)
-
-        is_inter_set = set()
-        for i in range(len(inter_src)):
-            is_inter_set.add((inter_src[i], inter_dst[i]))
-
-        edge_attr = []
-        for e in range(edge_index.size(1)):
-            si = edge_index[0, e].item()
-            di = edge_index[1, e].item()
-            dx = pos_2d[di, 0] - pos_2d[si, 0]
-            dy = pos_2d[di, 1] - pos_2d[si, 1]
-            dist = float(torch.sqrt(dx ** 2 + dy ** 2))
-            angle = float(np.arctan2(dy.item(), dx.item()))
-            slice_gap = abs(slice_ids[si].item() - slice_ids[di].item()) / max(total_slices, 1)
-            same_tissue = 1.0 if tissue_labels[si].item() == tissue_labels[di].item() else 0.0
-            edge_attr.append([
-                dist / SHARED["img_size"],
-                angle / np.pi,
-                slice_gap,
-                same_tissue,
-            ])
-        edge_attr = torch.tensor(edge_attr, dtype=torch.float32)
-
-    data = Data(
-        x=x,
-        edge_index=edge_index,
-        pos=pos_3d,
-        edge_attr=edge_attr,
-        tissue_labels=tissue_labels,
-        slice_ids=slice_ids,
-    )
-    return data
 
 
 # ── Hierarchical Graph Construction (SVGFormer-inspired) ─────────────
@@ -338,7 +115,7 @@ def build_hierarchical_graph(case_id, raw_4ch_3d, seg_mask_3d, config=None):
 
     1. Run supervoxel pipeline (3D SLIC + pruning + assignment)
     2. For each seg component → collect contained SV features (with relative PE)
-    3. Build inter-node edges (KNN + tissue compatibility, same as build_3d_graph)
+    3. Build inter-node edges (KNN + tissue compatibility)
     4. Return Data with SV features per node for IntraNodeAggregator
 
     Args:
@@ -424,7 +201,7 @@ def build_hierarchical_graph(case_id, raw_4ch_3d, seg_mask_3d, config=None):
     tissue_labels_t = torch.tensor(tissue_labels, dtype=torch.long)
     slice_ids_t = torch.tensor(slice_ids_list, dtype=torch.long)
 
-    # Step 3: inter-node edges (same logic as build_3d_graph)
+    # Step 3: inter-node edges (KNN + tissue compatibility)
     # Intra-"slice" edges via KNN on all nodes
     all_src, all_dst = [], []
     if n_nodes >= 2:
@@ -503,12 +280,11 @@ def load_metadata(config=None):
     return patient_slices, metadata
 
 
-def build_all_graphs(config=None, use_hierarchy=True):
-    """Build graphs for all patients and split into train/val/test.
+def build_all_graphs(config=None):
+    """Build hierarchical graphs for all patients and split into train/val/test.
 
-    If use_hierarchy=True, loads 3D volumes and builds hierarchical graphs
-    with supervoxel internal structure. Otherwise falls back to the original
-    slice-based build_3d_graph.
+    Loads 3D volumes and builds hierarchical graphs with supervoxel
+    internal structure for each patient.
     """
     config = config or GNN
     patient_slices, metadata = load_metadata(config)
@@ -517,24 +293,21 @@ def build_all_graphs(config=None, use_hierarchy=True):
 
     vol_dir = config["brats_output_dir"] / "volumes"
 
-    print("Building hierarchical volumetric graphs..." if use_hierarchy else "Building 3D graphs...")
+    print("Building hierarchical volumetric graphs...")
     graphs, splits = [], []
 
     for case_id, slice_list in patient_slices.items():
-        if use_hierarchy and vol_dir.exists():
-            raw_path = vol_dir / f"{case_id}_raw4ch.npy"
-            seg_path = vol_dir / f"{case_id}_seg.npy"
+        raw_path = vol_dir / f"{case_id}_raw4ch.npy"
+        seg_path = vol_dir / f"{case_id}_seg.npy"
 
-            if raw_path.exists() and seg_path.exists():
-                raw_4ch = np.load(str(raw_path))
-                seg_mask = np.load(str(seg_path))
-                g = build_hierarchical_graph(case_id, raw_4ch, seg_mask, config)
-                del raw_4ch, seg_mask  # free memory immediately
-            else:
-                # Fallback to slice-based if 3D volumes missing for this case
-                g = build_3d_graph(case_id, slice_list, config)
+        if raw_path.exists() and seg_path.exists():
+            raw_4ch = np.load(str(raw_path))
+            seg_mask = np.load(str(seg_path))
+            g = build_hierarchical_graph(case_id, raw_4ch, seg_mask, config)
+            del raw_4ch, seg_mask  # free memory immediately
         else:
-            g = build_3d_graph(case_id, slice_list, config)
+            print(f"  WARNING: 3D volumes missing for {case_id}, skipping")
+            continue
 
         g.case_id = case_id
         graphs.append(g)
@@ -560,7 +333,7 @@ def build_all_graphs(config=None, use_hierarchy=True):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Sub-phase 5B: Structural Features & NCN Architecture
+# Sub-phase 5B: Structural Features & OCN Architecture
 # ══════════════════════════════════════════════════════════════════════
 
 # ── Structural Features ──────────────────────────────────────────────
@@ -722,9 +495,9 @@ class StructuralFeatureComputer:
         return torch.tensor(topo, dtype=torch.float32)
 
 
-# ── NCN Encoder (GATv2) ──────────────────────────────────────────────
+# ── GATv2 Encoder ────────────────────────────────────────────────────
 
-class NCNEncoder(nn.Module):
+class GATv2Encoder(nn.Module):
     """3-layer GATv2 with residual connections and edge-attr awareness."""
 
     def __init__(self, in_dim, hidden_dim, out_dim, num_layers=3, heads=4, edge_dim=4, dropout=0.2):
@@ -761,9 +534,9 @@ class NCNEncoder(nn.Module):
         return out, alphas
 
 
-# ── NCN Edge Decoder ─────────────────────────────────────────────────
+# ── Multi-Signal Edge Decoder ────────────────────────────────────────
 
-class NCNEdgeDecoder(nn.Module):
+class MultiSignalDecoder(nn.Module):
     """6-signal decoder: Hadamard + concat + CN pool + structural + tissue-pair + edge-type."""
 
     def __init__(self, embed_dim, structural_feat_dim=3, num_tissue_types=3):
@@ -813,10 +586,10 @@ class NCNEdgeDecoder(nn.Module):
         return self.mlp(combined).squeeze(-1)
 
 
-# ── NCN Full Model ───────────────────────────────────────────────────
+# ── Full Model ───────────────────────────────────────────────────────
 
-class NCNEdgePredictor(nn.Module):
-    """Hierarchical NCN: IntraNodeAggregator + GATv2 encoder + tissue-aware decoder."""
+class EdgePredictor(nn.Module):
+    """Hierarchical OCN: IntraNodeAggregator + GATv2 encoder + multi-signal decoder."""
 
     def __init__(self, config=None):
         super().__init__()
@@ -825,7 +598,7 @@ class NCNEdgePredictor(nn.Module):
             sv_feat_dim=SUPERVOXEL["sv_feat_dim"],
             embed_dim=config["embed_dim"],
         )
-        self.encoder = NCNEncoder(
+        self.encoder = GATv2Encoder(
             in_dim=config["node_feat_dim"],  # 68 = 64 embed + 4 topo (added in Phase 3)
             hidden_dim=config["hidden_dim"],
             out_dim=config["embed_dim"],
@@ -833,38 +606,31 @@ class NCNEdgePredictor(nn.Module):
             heads=config["num_heads"],
             edge_dim=config["edge_attr_dim"],
         )
-        self.decoder = NCNEdgeDecoder(
+        self.decoder = MultiSignalDecoder(
             embed_dim=config["embed_dim"],
             structural_feat_dim=config["structural_feat_dim"],
         )
-        self._use_hierarchy = True  # set False to fallback to flat features
+
 
     def encode(self, data, return_attention=False):
+        """Encode node features via SV aggregation + topology + GATv2."""
         edge_attr = data.edge_attr if hasattr(data, 'edge_attr') and data.edge_attr is not None and data.edge_attr.size(0) > 0 else None
         device = data.x.device
 
-        # Hierarchical path: aggregate SVs → node embeddings + topology
-        if self._use_hierarchy and hasattr(data, 'sv_features') and len(data.sv_features) > 0:
-            node_embeds, sv_attns = self.aggregator(data.sv_features, device=device)
+        # Aggregate SVs into node embeddings
+        node_embeds, sv_attns = self.aggregator(data.sv_features, device=device)
 
-            # Compute intra-node topology (4-dim per node)
-            sf_computer = StructuralFeatureComputer()
-            sv_ei_list = data.sv_edge_indices if hasattr(data, 'sv_edge_indices') else []
-            n_svs = data.n_svs_per_node if hasattr(data, 'n_svs_per_node') else []
-            if sv_ei_list and n_svs:
-                topo_feats = sf_computer.compute_intra_node_topology(sv_ei_list, n_svs)
-                topo_feats = topo_feats.to(device)
-            else:
-                topo_feats = torch.zeros(node_embeds.size(0), 4, device=device)
-
-            x = torch.cat([node_embeds, topo_feats], dim=-1)  # (N, 68)
+        # Compute intra-node topology (4-dim per node)
+        sf_computer = StructuralFeatureComputer()
+        sv_ei_list = data.sv_edge_indices if hasattr(data, 'sv_edge_indices') else []
+        n_svs = data.n_svs_per_node if hasattr(data, 'n_svs_per_node') else []
+        if sv_ei_list and n_svs:
+            topo_feats = sf_computer.compute_intra_node_topology(sv_ei_list, n_svs)
+            topo_feats = topo_feats.to(device)
         else:
-            # Fallback: use data.x directly (for backward compatibility)
-            x = data.x
-            if x.size(1) < GNN["node_feat_dim"]:
-                pad = torch.zeros(x.size(0), GNN["node_feat_dim"] - x.size(1), device=device)
-                x = torch.cat([x, pad], dim=-1)
-            sv_attns = []
+            topo_feats = torch.zeros(node_embeds.size(0), 4, device=device)
+
+        x = torch.cat([node_embeds, topo_feats], dim=-1)  # (N, 68)
 
         z, alphas = self.encoder(x, data.edge_index, edge_attr=edge_attr, return_attention=return_attention)
         return z, alphas, sv_attns
@@ -1603,9 +1369,9 @@ if __name__ == "__main__":
     plot_3d_graphs(train_graphs)
 
     # Model
-    model = NCNEdgePredictor().to(SHARED["device"])
+    model = EdgePredictor().to(SHARED["device"])
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"NCNEdgePredictor | Parameters: {total_params:,}")
+    print(f"EdgePredictor | Parameters: {total_params:,}")
 
     # Train
     train_gnn(model, train_graphs, val_graphs)

@@ -1,12 +1,43 @@
 # ============================================
-# Non-GNN: Prediction, Classification, Segmentation
+# ARCHE Brain Tumor Pipeline - All Dependencies
 # ============================================
+# Install order matters: torch-geometric first so that
+# a compatible PyTorch version is resolved automatically.
+#
+# pip install -r requirements.txt
+
+# --- PyTorch Geometric (install first) ---
+# PyG will pull in a compatible torch version.
+torch-geometric>=2.4.0
+# PyG sparse backends (install matching your torch+CUDA):
+#   pip install torch-scatter torch-sparse \
+#     -f https://data.pyg.org/whl/torch-{TORCH}+{CUDA}.html
+# Example for torch 2.13.0 + CUDA 12.1:
+#   pip install torch-scatter torch-sparse \
+#     -f https://data.pyg.org/whl/torch-2.13.0+cu121.html
+
+# --- PyTorch core ---
 torch>=2.0.0
 torchvision>=0.15.0
+
+# --- Segmentation ---
+segmentation-models-pytorch>=0.3.0
+opencv-python>=4.7.0
+
+# --- Medical imaging ---
+nibabel>=5.0.0
+
+# --- Supervoxel generation ---
+scikit-image>=0.21.0
+
+# --- Scientific computing ---
 numpy>=1.24.0
 scipy>=1.10.0
 scikit-learn>=1.2.0
+
+# --- Visualization ---
 matplotlib>=3.7.0
 Pillow>=9.0.0
-nibabel>=5.0.0
-opencv-python>=4.7.0
+
+# --- Graph utilities ---
+networkx>=3.0

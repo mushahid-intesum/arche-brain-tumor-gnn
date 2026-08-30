@@ -173,7 +173,7 @@ def run_segmentation():
 # ══════════════════════════════════════════════════════════════════════
 
 def run_gnn():
-    """Build 3D graphs, train NCN model, generate reasoning traces."""
+    """Build 3D graphs, train OCN model, generate reasoning traces."""
     print("\n" + "=" * 70)
     print("PHASE 4: 3D GNN EDGE PREDICTION")
     print("=" * 70)
@@ -181,9 +181,9 @@ def run_gnn():
     train_graphs, val_graphs, test_graphs = gnn.build_all_graphs()
     gnn.plot_3d_graphs(train_graphs)
 
-    model = gnn.NCNEdgePredictor().to(SHARED["device"])
+    model = gnn.EdgePredictor().to(SHARED["device"])
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"NCNEdgePredictor | Parameters: {total_params:,}")
+    print(f"EdgePredictor | Parameters: {total_params:,}")
 
     gnn.train_gnn(model, train_graphs, val_graphs)
 

@@ -1,13 +1,3 @@
-"""
-Phase 4: Hierarchical Supervoxel-Segmentation GNN
-OCN (Orthogonalized Common Neighbor) architecture with:
-  - SVGFormer-inspired supervoxel intra-node aggregation (IntraNodeAggregator)
-  - GATv2 encoder with residual connections
-  - OCN-enhanced structural features (StructuralFeatureComputer)
-  - Multi-signal tissue-aware edge decoder
-Input: brats_outputs/ (3D volumes + predicted masks from segmentation pipeline)
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,30 +7,13 @@ from collections import defaultdict
 from torch_geometric.data import Data
 from torch_geometric.utils import to_undirected
 from torch_geometric.nn import knn_graph, GATv2Conv, LayerNorm
-from torch_geometric.utils import negative_sampling
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 from config import SHARED, GNN, SUPERVOXEL
 from supervoxel import process_case_supervoxels
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Hierarchical Graph Construction & Feature Extraction
-# ══════════════════════════════════════════════════════════════════════
-
-
-# ── Hierarchical Graph Construction (SVGFormer-inspired) ─────────────
-
 class IntraNodeAggregator(nn.Module):
-    """Aggregate supervoxel features within each segmentation node.
-
-    For each seg node:
-      1. Collect SV features of contained supervoxels (K_i × sv_feat_dim)
-      2. Prepend a learnable [CLS] token
-      3. 2-layer Transformer encoder over the set
-      4. Output = [CLS] embedding (64-dim) + attention weights for explanation
-    """
-
     def __init__(self, sv_feat_dim=None, embed_dim=None, n_heads=4, n_layers=2, dropout=0.1):
         super().__init__()
         sv_feat_dim = sv_feat_dim or SUPERVOXEL["sv_feat_dim"]
@@ -59,17 +32,6 @@ class IntraNodeAggregator(nn.Module):
         self.embed_dim = embed_dim
 
     def forward(self, sv_features_list, device=None):
-        """Aggregate SV features for all seg nodes in a graph.
-
-        Args:
-            sv_features_list: list of (K_i, sv_feat_dim) tensors, one per seg node.
-                              K_i can vary per node.
-            device: target device.
-
-        Returns:
-            node_embeds: (N_seg, embed_dim) tensor.
-            sv_attentions: list of (K_i,) tensors — attention weights for explanation.
-        """
         device = device or SHARED["device"]
         n_nodes = len(sv_features_list)
 
@@ -110,12 +72,59 @@ class IntraNodeAggregator(nn.Module):
         return node_embeds, sv_attentions
 
 
+def build_inter_edges(pos_3d, tissue_labels, strategy="compatibility_only", k=None):
+    """Build inter-node edges between segmentation components.
+
+    Args:
+        pos_3d: (N, 3) tensor of node centroids.
+        tissue_labels: list of int, tissue type per node (1=NCR, 2=ED, 3=ET).
+        strategy: "compatibility_only" or "knn_filtered".
+        k: number of neighbors for knn_filtered strategy.
+
+    Returns:
+        edge_index: (2, E) tensor of undirected edges.
+    """
+    n_nodes = pos_3d.size(0)
+    all_src, all_dst = [], []
+
+    if strategy == "knn_filtered" and k is not None and k >= 1 and n_nodes >= 2:
+        actual_k = min(k, n_nodes - 1)
+        if actual_k >= 1:
+            ei = knn_graph(pos_3d, k=actual_k, loop=False)
+            # Filter by tissue compatibility
+            for idx in range(ei.size(1)):
+                ni, nj = ei[0, idx].item(), ei[1, idx].item()
+                ti, tj = tissue_labels[ni], tissue_labels[nj]
+                compatible = (ti == tj) or (abs(ti - tj) <= 1) or ({ti, tj} == {1, 3})
+                if compatible:
+                    all_src.append(ni)
+                    all_dst.append(nj)
+
+    elif strategy == "compatibility_only":
+        # Connect ALL tissue-compatible pairs (no distance filter)
+        for ni in range(n_nodes):
+            for nj in range(ni + 1, n_nodes):
+                ti = tissue_labels[ni]
+                tj = tissue_labels[nj]
+                compatible = (ti == tj) or (abs(ti - tj) <= 1) or ({ti, tj} == {1, 3})
+                if compatible:
+                    all_src.extend([ni, nj])
+                    all_dst.extend([nj, ni])
+
+    if len(all_src) == 0:
+        return torch.zeros(2, 0, dtype=torch.long)
+
+    edge_index = torch.tensor([all_src, all_dst], dtype=torch.long)
+    edge_index = to_undirected(edge_index)
+    return edge_index
+
+
 def build_hierarchical_graph(case_id, raw_4ch_3d, seg_mask_3d, config=None):
     """Build a hierarchical graph: seg nodes with SV internal structure.
 
     1. Run supervoxel pipeline (3D SLIC + pruning + assignment)
-    2. For each seg component → collect contained SV features (with relative PE)
-    3. Build inter-node edges (KNN + tissue compatibility)
+    2. For each seg component, collect contained SV features (with relative PE)
+    3. Build inter-node edges via configurable strategy
     4. Return Data with SV features per node for IntraNodeAggregator
 
     Args:
@@ -126,7 +135,7 @@ def build_hierarchical_graph(case_id, raw_4ch_3d, seg_mask_3d, config=None):
 
     Returns:
         Data object with fields:
-          - x: placeholder (N_seg, sv_feat_dim) — mean SV features per node
+          - x: placeholder (N_seg, sv_feat_dim) -- mean SV features per node
           - edge_index, edge_attr, pos, tissue_labels, slice_ids: as before
           - sv_features: list of (K_i, 25) tensors per node
           - sv_edge_indices: list of (2, E_i) tensors per node
@@ -135,7 +144,6 @@ def build_hierarchical_graph(case_id, raw_4ch_3d, seg_mask_3d, config=None):
     config = config or GNN
     sv_config = SUPERVOXEL
 
-    # Step 1: supervoxel pipeline
     sv_result = process_case_supervoxels(case_id, raw_4ch_3d, seg_mask_3d, sv_config)
     components = sv_result["components"]
 
@@ -154,13 +162,11 @@ def build_hierarchical_graph(case_id, raw_4ch_3d, seg_mask_3d, config=None):
     n_nodes = len(components)
     H, W, D = seg_mask_3d.shape
 
-    # Step 2: assemble per-node data
     sv_features_list = []
     sv_edge_indices_list = []
     n_svs_list = []
     positions = []
     tissue_labels = []
-    # Use mean z-coordinate of each component as "slice_id"
     slice_ids_list = []
 
     for comp in components:
@@ -168,12 +174,10 @@ def build_hierarchical_graph(case_id, raw_4ch_3d, seg_mask_3d, config=None):
         positions.append(comp["centroid"])
         tissue_labels.append(comp["tissue_label"])
 
-        # Mean z of component voxels as slice id proxy
         coords = np.argwhere(comp["mask"])
         mean_z = float(coords[:, 2].mean()) if len(coords) > 0 else 0.0
         slice_ids_list.append(int(mean_z))
 
-        # SV features for this component
         if comp_id in sv_result["sv_features_per_comp"]:
             sv_feats = sv_result["sv_features_per_comp"][comp_id]
             sv_features_list.append(sv_feats)
@@ -182,13 +186,11 @@ def build_hierarchical_graph(case_id, raw_4ch_3d, seg_mask_3d, config=None):
             sv_features_list.append(torch.zeros(0, sv_config["sv_feat_dim"]))
             n_svs_list.append(0)
 
-        # Intra-SV edges
         if comp_id in sv_result["sv_edges_per_comp"]:
             sv_edge_indices_list.append(sv_result["sv_edges_per_comp"][comp_id])
         else:
             sv_edge_indices_list.append(torch.zeros(2, 0, dtype=torch.long))
 
-    # Placeholder x: mean of SV features per node (for compatibility)
     x_list = []
     for sv_f in sv_features_list:
         if sv_f.size(0) > 0:
@@ -201,36 +203,14 @@ def build_hierarchical_graph(case_id, raw_4ch_3d, seg_mask_3d, config=None):
     tissue_labels_t = torch.tensor(tissue_labels, dtype=torch.long)
     slice_ids_t = torch.tensor(slice_ids_list, dtype=torch.long)
 
-    # Step 3: inter-node edges (KNN + tissue compatibility)
-    # Intra-"slice" edges via KNN on all nodes
-    all_src, all_dst = [], []
-    if n_nodes >= 2:
-        k = min(config["k_neighbors"], n_nodes - 1)
-        if k >= 1:
-            ei = knn_graph(pos_3d, k=k, loop=False)
-            all_src.extend(ei[0].tolist())
-            all_dst.extend(ei[1].tolist())
+    # Inter-node edges via configurable strategy
+    edge_strategy = config.get("edge_strategy", "compatibility_only")
+    k = config.get("k_neighbors", 3)
+    edge_index = build_inter_edges(pos_3d, tissue_labels, strategy=edge_strategy, k=k)
 
-    # Tissue-compatible edges for nearby nodes
-    for ni in range(n_nodes):
-        for nj in range(ni + 1, n_nodes):
-            dist = float(torch.norm(pos_3d[ni] - pos_3d[nj]))
-            if dist > 0.3:  # normalized distance threshold
-                continue
-            ti = tissue_labels[ni]
-            tj = tissue_labels[nj]
-            compatible = (ti == tj) or (abs(ti - tj) <= 1) or ({ti, tj} == {1, 3})
-            if compatible:
-                all_src.extend([ni, nj])
-                all_dst.extend([nj, ni])
-
-    if len(all_src) == 0:
-        edge_index = torch.zeros(2, 0, dtype=torch.long)
+    if edge_index.size(1) == 0:
         edge_attr = torch.zeros(0, config["edge_attr_dim"])
     else:
-        edge_index = torch.tensor([all_src, all_dst], dtype=torch.long)
-        edge_index = to_undirected(edge_index)
-
         edge_attr = []
         for e in range(edge_index.size(1)):
             si = edge_index[0, e].item()
@@ -647,6 +627,115 @@ class EdgePredictor(nn.Module):
         pos_pred = self.decode(z, pos_ei, pos_sf, pos_cn, pos_src_t, pos_dst_t, pos_inter)
         neg_pred = self.decode(z, neg_ei, neg_sf, neg_cn, neg_src_t, neg_dst_t, neg_inter)
         return pos_pred, neg_pred, z, alphas
+
+    def gradient_saliency(self, data, edge_idx, structural_feats,
+                          cn_indices, src_tissue, dst_tissue, is_inter):
+        """Compute gradient-based saliency for a target edge prediction.
+
+        Backpropagates through the prediction logit to produce importance
+        scores at three hierarchy levels:
+          1. Node-level: gradient magnitude w.r.t. node embeddings
+          2. SV-level: gradient magnitude w.r.t. SV features per endpoint
+          3. Edge-level: gradient magnitude w.r.t. edge attributes
+
+        Args:
+            data: PyG Data object (must have sv_features).
+            edge_idx: int, index into data.edge_index.
+            structural_feats: (E, sf_dim) structural features tensor.
+            cn_indices: list of lists, common neighbor indices.
+            src_tissue, dst_tissue, is_inter: per-edge metadata tensors.
+
+        Returns:
+            dict with:
+              node_saliency: (N,) per-node importance
+              sv_saliency: {node_id: (K,) per-SV importance} for src/dst
+              edge_saliency: (edge_attr_dim,) importance per edge feature
+        """
+        self.eval()
+        device = next(self.parameters()).device
+        data = data.to(device)
+
+        # Enable gradients on SV features
+        sv_grads_available = []
+        if hasattr(data, 'sv_features') and data.sv_features:
+            for sv_f in data.sv_features:
+                if sv_f.size(0) > 0:
+                    sv_f.requires_grad_(True)
+                    sv_grads_available.append(sv_f)
+
+        # Enable gradients on edge_attr
+        edge_attr_grad = None
+        if (hasattr(data, 'edge_attr') and data.edge_attr is not None
+                and data.edge_attr.size(0) > 0):
+            data.edge_attr.requires_grad_(True)
+            edge_attr_grad = data.edge_attr
+
+        # Forward
+        z, _, sv_attns = self.encode(data, return_attention=False)
+
+        # Target edge prediction
+        ei = data.edge_index[:, edge_idx:edge_idx+1]
+        sf = structural_feats[edge_idx:edge_idx+1].to(device)
+        cn = [cn_indices[edge_idx]]
+        st = src_tissue[edge_idx:edge_idx+1].to(device)
+        dt = dst_tissue[edge_idx:edge_idx+1].to(device)
+        inter = is_inter[edge_idx:edge_idx+1].to(device)
+
+        logit = self.decode(z, ei, sf, cn, st, dt, inter)
+        logit.backward()
+
+        # ── Node-level saliency ──
+        # z doesn't have grad (it's computed), so use the input projection's grad
+        # We compute per-node importance from the SV feature gradients
+        n_nodes = data.x.size(0)
+        node_saliency = torch.zeros(n_nodes, device=device)
+
+        src_node = ei[0, 0].item()
+        dst_node = ei[1, 0].item()
+
+        # ── SV-level saliency ──
+        sv_saliency = {}
+        for node in [src_node, dst_node]:
+            if (hasattr(data, 'sv_features') and node < len(data.sv_features)
+                    and data.sv_features[node].grad is not None):
+                grad_mag = data.sv_features[node].grad.abs().sum(dim=-1)
+                sv_saliency[node] = grad_mag.detach().cpu()
+                node_saliency[node] = grad_mag.sum().item()
+
+        # ── Edge-level saliency ──
+        edge_saliency = torch.zeros(data.edge_attr.size(1) if edge_attr_grad is not None else 0)
+        if edge_attr_grad is not None and edge_attr_grad.grad is not None:
+            edge_saliency = edge_attr_grad.grad[edge_idx].abs().detach().cpu()
+
+        # Normalize node saliency
+        node_saliency = node_saliency.detach().cpu()
+        if node_saliency.max() > 0:
+            node_saliency = node_saliency / node_saliency.max()
+
+        # Normalize SV saliency per node
+        for node in sv_saliency:
+            if sv_saliency[node].max() > 0:
+                sv_saliency[node] = sv_saliency[node] / sv_saliency[node].max()
+
+        # Clean up
+        self.zero_grad()
+        for sv_f in sv_grads_available:
+            if sv_f.grad is not None:
+                sv_f.grad = None
+            sv_f.requires_grad_(False)
+        if edge_attr_grad is not None:
+            if edge_attr_grad.grad is not None:
+                edge_attr_grad.grad = None
+            edge_attr_grad.requires_grad_(False)
+
+        return {
+            "node_saliency": node_saliency,
+            "sv_saliency": sv_saliency,
+            "edge_saliency": edge_saliency,
+            "src_node": src_node,
+            "dst_node": dst_node,
+            "sv_attentions": sv_attns,
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════

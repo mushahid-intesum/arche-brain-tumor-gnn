@@ -109,7 +109,8 @@ SUPERVOXEL = {
     "n_segments": 500,          # initial SV count before pruning
     "compactness": 0.1,         # SLIC compactness (low = more intensity-driven)
     "sv_feat_dim": 25,          # 22 base + 3 relative PE
-    "intra_k": 5,               # KNN within each seg component
+    "intra_k": 3,               # KNN within each seg component (used only when sv_edge_method="knn")
+    "sv_edge_method": "delaunay",  # "delaunay" or "knn" for intra-node SV edges
     "min_sv_volume": 20,        # minimum voxels per SV
     "cache_dir": Path("brats_outputs/supervoxels"),
 }
@@ -123,11 +124,12 @@ GNN = {
     "hidden_dim": 128,
     "embed_dim": 64,
     "num_heads": 4,
-    "num_layers": 3,
+    "num_layers": 2,            # 2 layers default (less oversmoothing on small graphs)
     "edge_attr_dim": 4,
     "structural_feat_dim": 5,   # 3 base + 2 OCN (residual + path-norm)
     "min_region_area": 10,
-    "k_neighbors": 5,
+    "edge_strategy": "compatibility_only",  # "compatibility_only" or "knn_filtered"
+    "k_neighbors": 3,           # only used when edge_strategy="knn_filtered"
     "inter_slice_dist_thresh": 50.0,
     "epochs": 80,
     "lr": 5e-4,

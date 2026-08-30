@@ -1,9 +1,3 @@
-"""
-Supervoxel Generation Module (SVGFormer-inspired)
-3D SLIC clustering on raw MRI volumes → supervoxel features, assignment matrices,
-and intra-node edge construction for the hierarchical GNN pipeline.
-"""
-
 import numpy as np
 import torch
 from pathlib import Path
@@ -13,25 +7,12 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import laplacian
 
 from config import SHARED, SUPERVOXEL, SEGMENTATION
+from skimage.segmentation import slic
+from torch_geometric.nn import knn_graph
+from scipy.spatial import Delaunay
 
-
-# ══════════════════════════════════════════════════════════════════════
-# 3D SLIC Supervoxel Generation
-# ══════════════════════════════════════════════════════════════════════
 
 def generate_3d_supervoxels(t1_volume, n_segments=None, compactness=None):
-    """Run 3D SLIC on the T1 volume to produce supervoxel labels.
-
-    Args:
-        t1_volume: (H, W, D) float32 array, z-score normalized T1 volume.
-        n_segments: target number of supervoxels.
-        compactness: SLIC compactness (lower = more intensity-driven boundaries).
-
-    Returns:
-        sv_labels: (H, W, D) int array, supervoxel ID per voxel.
-    """
-    from skimage.segmentation import slic
-
     n_segments = n_segments or SUPERVOXEL["n_segments"]
     compactness = compactness or SUPERVOXEL["compactness"]
 
@@ -39,7 +20,7 @@ def generate_3d_supervoxels(t1_volume, n_segments=None, compactness=None):
         t1_volume,
         n_segments=n_segments,
         compactness=compactness,
-        channel_axis=None,      # single-channel 3D volume
+        channel_axis=None,
         enforce_connectivity=True,
         start_label=0,
     )
@@ -47,20 +28,6 @@ def generate_3d_supervoxels(t1_volume, n_segments=None, compactness=None):
 
 
 def prune_background_svs(sv_labels, t1_volume, min_volume=None):
-    """Remove background supervoxels using intensity gap detection.
-
-    SVGFormer §3: sort SV mean intensities, find the largest gap in the
-    sorted sequence, discard all SVs below the gap.
-
-    Args:
-        sv_labels: (H, W, D) int array from generate_3d_supervoxels.
-        t1_volume: (H, W, D) float32 array.
-        min_volume: minimum voxel count per SV.
-
-    Returns:
-        valid_sv_ids: list of int, IDs of retained supervoxels.
-        sv_means: dict[sv_id] → mean T1 intensity.
-    """
     min_volume = min_volume or SUPERVOXEL["min_sv_volume"]
     unique_ids = np.unique(sv_labels)
 
@@ -99,28 +66,7 @@ def prune_background_svs(sv_labels, t1_volume, min_volume=None):
 
     return valid_sv_ids, sv_means
 
-
-# ══════════════════════════════════════════════════════════════════════
-# Supervoxel Feature Extraction
-# ══════════════════════════════════════════════════════════════════════
-
 def compute_sv_features(sv_labels, raw_4ch_volume, valid_sv_ids):
-    """Compute handcrafted features for each supervoxel (22-dim).
-
-    Per-modality (4 modalities × 4 stats = 16):
-        mean, std, range, skewness
-    Spatial (3): centroid (x, y, z) normalized
-    Morphology (3): volume, surface area (approx), compactness
-
-    Args:
-        sv_labels: (H, W, D) int array.
-        raw_4ch_volume: (4, H, W, D) float32 array.
-        valid_sv_ids: list of SV IDs to process.
-
-    Returns:
-        sv_feats: dict[sv_id] → numpy array of shape (22,)
-        sv_centroids: dict[sv_id] → (x, y, z) normalized centroid
-    """
     H, W, D = sv_labels.shape
     max_dim = max(H, W, D)
     sv_feats = {}
@@ -170,19 +116,6 @@ def compute_sv_features(sv_labels, raw_4ch_volume, valid_sv_ids):
 
 
 def compute_relative_pe(sv_centroids_in_node, seg_node_centroid):
-    """Compute 3D relative positional encoding for SVs within a node.
-
-    PE = (sv_centroid - seg_centroid) / seg_radius
-
-    This distinguishes boundary SVs from interior SVs.
-
-    Args:
-        sv_centroids_in_node: (K, 3) array of SV centroids.
-        seg_node_centroid: (3,) array, centroid of the parent seg node.
-
-    Returns:
-        relative_pe: (K, 3) array.
-    """
     offsets = sv_centroids_in_node - seg_node_centroid[np.newaxis, :]
 
     # Radius = max distance of any SV from seg centroid
@@ -192,24 +125,7 @@ def compute_relative_pe(sv_centroids_in_node, seg_node_centroid):
     return (offsets / radius).astype(np.float32)
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Assignment Matrix & Intra-Node Edges
-# ══════════════════════════════════════════════════════════════════════
-
 def extract_seg_components_3d(seg_mask):
-    """Extract connected components from a 3D segmentation mask.
-
-    Args:
-        seg_mask: (H, W, D) int array with labels {0=BG, 1=NCR, 2=ED, 3=ET}.
-
-    Returns:
-        components: list of dicts with keys:
-            - 'id': component index
-            - 'tissue_label': int (1, 2, or 3)
-            - 'mask': (H, W, D) bool array
-            - 'centroid': (3,) normalized centroid
-            - 'volume': int
-    """
     H, W, D = seg_mask.shape
     components = []
     comp_id = 0
@@ -247,22 +163,6 @@ def extract_seg_components_3d(seg_mask):
 
 
 def compute_assignment_matrix(sv_labels, valid_sv_ids, components):
-    """Compute spatial overlap between supervoxels and segmentation components.
-
-    S[i, j] = |SV_i ∩ Seg_j| / |SV_i|
-
-    Each row sums to ≤ 1.0 (< 1.0 if the SV partially overlaps background).
-
-    Args:
-        sv_labels: (H, W, D) int array.
-        valid_sv_ids: list of retained SV IDs.
-        components: list of seg component dicts from extract_seg_components_3d.
-
-    Returns:
-        S: (N_sv, N_seg) float32 numpy array.
-        sv_to_seg: dict[sv_id] → seg_comp_id (majority assignment).
-        tumor_sv_ids: list of SV IDs that overlap with any seg component.
-    """
     n_sv = len(valid_sv_ids)
     n_seg = len(components)
 
@@ -303,21 +203,6 @@ def compute_assignment_matrix(sv_labels, valid_sv_ids, components):
 
 
 def build_intra_sv_edges(sv_centroids, tumor_sv_ids, sv_to_seg, k=None):
-    """Build KNN edges among supervoxels within each segmentation component.
-
-    Args:
-        sv_centroids: dict[sv_id] → (3,) centroid array.
-        tumor_sv_ids: list of SV IDs overlapping tumor.
-        sv_to_seg: dict[sv_id] → seg component index.
-        k: number of neighbors.
-
-    Returns:
-        edges_per_comp: dict[seg_comp_id] → (2, E) edge index tensor
-                        (indices are LOCAL within the component's SV list).
-        svs_per_comp: dict[seg_comp_id] → list of sv_ids in that component.
-    """
-    from torch_geometric.nn import knn_graph
-
     k = k or SUPERVOXEL["intra_k"]
 
     # Group SVs by their seg component
@@ -351,29 +236,78 @@ def build_intra_sv_edges(sv_centroids, tumor_sv_ids, sv_to_seg, k=None):
     return edges_per_comp, svs_per_comp
 
 
-# ══════════════════════════════════════════════════════════════════════
-# Caching & Full Pipeline
-# ══════════════════════════════════════════════════════════════════════
+def build_intra_sv_edges_delaunay(sv_centroids, tumor_sv_ids, sv_to_seg):
+    """Build edges among SVs within each seg component using Delaunay triangulation.
+
+    Delaunay triangulation connects points whose Voronoi cells share a face,
+    producing a spatially principled graph without requiring a k parameter
+    (Barber et al., 1996, ACM Trans. on Mathematical Software).
+
+    For fewer than 4 SVs (insufficient for 3D Delaunay), falls back to
+    fully connected.
+    """
+    comp_svs = defaultdict(list)
+    for sv_id in tumor_sv_ids:
+        if sv_id in sv_to_seg:
+            comp_svs[sv_to_seg[sv_id]].append(sv_id)
+
+    edges_per_comp = {}
+    svs_per_comp = {}
+
+    for comp_id, sv_list in comp_svs.items():
+        svs_per_comp[comp_id] = sv_list
+
+        if len(sv_list) < 2:
+            edges_per_comp[comp_id] = torch.zeros(2, 0, dtype=torch.long)
+            continue
+
+        positions = np.stack([sv_centroids[sid] for sid in sv_list])
+
+        if len(sv_list) < 4:
+            # Fewer than 4 points: 3D Delaunay needs at least 4 non-coplanar points.
+            # Fall back to fully connected.
+            src, dst = [], []
+            for i in range(len(sv_list)):
+                for j in range(i + 1, len(sv_list)):
+                    src.extend([i, j])
+                    dst.extend([j, i])
+            edges_per_comp[comp_id] = torch.tensor([src, dst], dtype=torch.long)
+            continue
+
+        try:
+            tri = Delaunay(positions)
+            edge_set = set()
+            for simplex in tri.simplices:
+                # Each simplex is a tetrahedron (4 vertices in 3D).
+                # Extract all 6 edges from the tetrahedron.
+                for i in range(4):
+                    for j in range(i + 1, 4):
+                        a, b = int(simplex[i]), int(simplex[j])
+                        edge_set.add((min(a, b), max(a, b)))
+
+            if len(edge_set) == 0:
+                edges_per_comp[comp_id] = torch.zeros(2, 0, dtype=torch.long)
+                continue
+
+            src, dst = [], []
+            for a, b in edge_set:
+                src.extend([a, b])
+                dst.extend([b, a])
+            edges_per_comp[comp_id] = torch.tensor([src, dst], dtype=torch.long)
+
+        except Exception:
+            # Degenerate case (coplanar points etc.): fall back to fully connected
+            src, dst = [], []
+            for i in range(len(sv_list)):
+                for j in range(i + 1, len(sv_list)):
+                    src.extend([i, j])
+                    dst.extend([j, i])
+            edges_per_comp[comp_id] = torch.tensor([src, dst], dtype=torch.long)
+
+    return edges_per_comp, svs_per_comp
+
 
 def process_case_supervoxels(case_id, raw_4ch_volume, seg_mask, config=None):
-    """Full supervoxel pipeline for one patient case.
-
-    1. 3D SLIC on T1 → sv_labels
-    2. Prune background
-    3. Extract 3D seg components
-    4. Compute assignment matrix
-    5. Extract SV features + relative PE per seg node
-    6. Build intra-SV edges per seg node
-
-    Args:
-        case_id: str, patient identifier.
-        raw_4ch_volume: (4, H, W, D) float32.
-        seg_mask: (H, W, D) int.
-        config: optional config override.
-
-    Returns:
-        result dict with all supervoxel data for this case.
-    """
     config = config or SUPERVOXEL
 
     cache_dir = Path(config["cache_dir"])
@@ -414,10 +348,16 @@ def process_case_supervoxels(case_id, raw_4ch_volume, seg_mask, config=None):
     # Step 5: SV features
     sv_feats, sv_centroids = compute_sv_features(sv_labels, raw_4ch_volume, tumor_sv_ids)
 
-    # Step 6: Intra-SV edges
-    edges_per_comp, svs_per_comp = build_intra_sv_edges(
-        sv_centroids, tumor_sv_ids, sv_to_seg, config["intra_k"],
-    )
+    # Step 6: Intra-SV edges (dispatch based on config)
+    sv_edge_method = config.get("sv_edge_method", "delaunay")
+    if sv_edge_method == "delaunay":
+        edges_per_comp, svs_per_comp = build_intra_sv_edges_delaunay(
+            sv_centroids, tumor_sv_ids, sv_to_seg,
+        )
+    else:
+        edges_per_comp, svs_per_comp = build_intra_sv_edges(
+            sv_centroids, tumor_sv_ids, sv_to_seg, config.get("intra_k", 3),
+        )
 
     # Step 7: Relative PE + final feature assembly per seg component
     sv_features_per_comp = {}  # comp_id → (K, 25) tensor

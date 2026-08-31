@@ -400,20 +400,24 @@ def build_knn_graph(retained_labels, targets, k=None):
             sym_dst.append(s)
             sym_attr.append(rev_delta)
 
-    edge_index = np.array([sym_src, sym_dst], dtype=np.int64)   # (2, E)
-    edge_attr = np.array(sym_attr, dtype=np.float32)             # (E, 4)
+    if len(sym_src) > 0:
+        edge_index = np.array([sym_src, sym_dst], dtype=np.int64)   # (2, E)
+        edge_attr = np.array(sym_attr, dtype=np.float32).reshape(-1, 4)  # (E, 4)
+    else:
+        edge_index = np.zeros((2, 0), dtype=np.int64)
+        edge_attr = np.zeros((0, 4), dtype=np.float32)
 
     # Degree statistics
-    degrees = np.bincount(edge_index[0], minlength=N)
+    degrees = np.bincount(edge_index[0] if edge_index.shape[1] > 0 else [], minlength=N)
 
     graph_info = {
         "num_nodes": N,
         "num_edges": edge_index.shape[1],
         "k": k,
         "mean_degree": float(degrees.mean()),
-        "min_degree": int(degrees.min()),
-        "max_degree": int(degrees.max()),
-        "avg_edge_dist": float(edge_attr[:, 3].mean()),
+        "min_degree": int(degrees.min()) if len(degrees) > 0 else 0,
+        "max_degree": int(degrees.max()) if len(degrees) > 0 else 0,
+        "avg_edge_dist": float(edge_attr[:, 3].mean()) if edge_attr.shape[0] > 0 else 0.0,
     }
 
     return edge_index, edge_attr, label_to_idx, idx_to_label, graph_info

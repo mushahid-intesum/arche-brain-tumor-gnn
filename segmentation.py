@@ -1,9 +1,3 @@
-"""
-Phase 3: Multi-class Brain Tumor Segmentation
-DeepLabV3+ (EfficientNet-B4) with 4-channel MRI input → 4-class output.
-Dataset: BraTS 2023 GLI (NIfTI volumes)
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,7 +19,6 @@ from config import SHARED, SEGMENTATION
 # ── Data Loading ──────────────────────────────────────────────────────
 
 def discover_cases(data_dir):
-    """Find all valid BraTS cases with 4 modalities + segmentation mask."""
     cases = sorted([d for d in Path(data_dir).iterdir() if d.is_dir()])
     valid_cases = []
     for case_dir in cases:
@@ -43,13 +36,11 @@ def discover_cases(data_dir):
 
 
 def load_volume(nii_path):
-    """Load a NIfTI volume as float32 numpy array."""
     vol = nib.load(str(nii_path))
     return vol.get_fdata().astype(np.float32)
 
 
 def zscore_normalize(volume):
-    """Z-score normalize non-zero voxels (standard BraTS preprocessing)."""
     mask = volume > 0
     if mask.sum() == 0:
         return volume
@@ -62,10 +53,6 @@ def zscore_normalize(volume):
 
 
 def extract_and_save_slices(case, cache_dir, config=None):
-    """Extract 2D tumor slices from a case and save to disk.
-
-    Skips extraction if cached slices from a previous run are found.
-    """
     config = config or SEGMENTATION
 
     # Check cache: look for existing slices for this case
@@ -140,8 +127,6 @@ def extract_and_save_slices(case, cache_dir, config=None):
 
 
 class BraTSSliceDataset(Dataset):
-    """Lazy-loading BraTS slice dataset (reads .npy files on demand)."""
-
     def __init__(self, slice_meta_list, augment=False):
         self.meta = slice_meta_list
         self.augment = augment
@@ -170,7 +155,6 @@ class BraTSSliceDataset(Dataset):
 
 
 def prepare_data(config=None):
-    """Full data pipeline: discover → extract → split → dataloaders."""
     config = config or SEGMENTATION
     cache_dir = config["output_dir"] / "slice_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -229,7 +213,6 @@ def prepare_data(config=None):
 # ── Model ─────────────────────────────────────────────────────────────
 
 def build_segmentation_model(config=None):
-    """DeepLabV3+ with EfficientNet-B4, 4-channel input, 4-class output."""
     config = config or SEGMENTATION
     model = smp.DeepLabV3Plus(
         encoder_name="efficientnet-b4",
@@ -259,8 +242,6 @@ def build_segmentation_model(config=None):
 # ── Loss & Metrics ────────────────────────────────────────────────────
 
 class DiceCELoss(nn.Module):
-    """Combined Dice + CrossEntropy loss for multi-class segmentation."""
-
     def __init__(self, num_classes=4, dice_weight=1.0, ce_weight=1.0, smooth=1e-5):
         super().__init__()
         self.num_classes = num_classes
@@ -285,7 +266,6 @@ class DiceCELoss(nn.Module):
 
 
 def compute_dice_per_class(pred_mask, gt_mask, num_classes=4, smooth=1e-5):
-    """Per-class Dice scores (excludes background)."""
     dice = {}
     for c in range(1, num_classes):
         pred_c = (pred_mask == c).float()
@@ -297,7 +277,6 @@ def compute_dice_per_class(pred_mask, gt_mask, num_classes=4, smooth=1e-5):
 
 
 def compute_brats_regions(pred_mask, gt_mask, smooth=1e-5):
-    """Official BraTS region Dice: ET, TC, WT."""
     def dice(p, g):
         inter = (p * g).sum()
         return ((2.0 * inter + smooth) / (p.sum() + g.sum() + smooth)).item()
@@ -313,7 +292,6 @@ def compute_brats_regions(pred_mask, gt_mask, smooth=1e-5):
 # ── Training ──────────────────────────────────────────────────────────
 
 def train_segmentation(model, train_loader, val_loader, config=None):
-    """Full training loop with gradient accumulation and OneCycleLR."""
     config = config or SEGMENTATION
     criterion = DiceCELoss(num_classes=config["num_classes"])
     optimizer = optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
@@ -376,7 +354,6 @@ def train_segmentation(model, train_loader, val_loader, config=None):
 
 @torch.no_grad()
 def evaluate_segmentation(model, loader, criterion=None):
-    """Evaluate segmentation with per-class and BraTS region Dice."""
     model.eval()
     criterion = criterion or DiceCELoss(num_classes=SEGMENTATION["num_classes"])
     val_loss = 0.0
@@ -414,7 +391,6 @@ def evaluate_segmentation(model, loader, criterion=None):
 # ── Export ────────────────────────────────────────────────────────────
 
 def export_for_gnn(model, train_meta, val_meta, test_meta, config=None):
-    """Export predicted masks, GT masks, raw slices, and 3D volumes for the GNN pipeline."""
     config = config or SEGMENTATION
     output = config["output_dir"]
     masks_dir = output / "masks"
@@ -505,10 +481,111 @@ def export_for_gnn(model, train_meta, val_meta, test_meta, config=None):
     return metadata
 
 
+def export_seg_probabilities(model, data_dir=None, output_dir=None, config=None):
+    config = config or SEGMENTATION
+    data_dir = Path(data_dir) if data_dir else config["data_root"]
+    prob_dir = Path(output_dir) if output_dir else config["output_dir"] / "seg_probs"
+    prob_dir.mkdir(parents=True, exist_ok=True)
+
+    img_size = SHARED["img_size"]
+    num_classes = config["num_classes"]
+
+    # Discover cases (handles both .nii and .nii.gz)
+    cases = sorted([d for d in data_dir.iterdir() if d.is_dir()])
+    valid_cases = []
+    for case_dir in cases:
+        case_id = case_dir.name
+        files = {}
+        all_found = True
+        for key in [*config["modalities"], "seg"]:
+            nii = case_dir / f"{case_id}-{key}.nii"
+            nii_gz = case_dir / f"{case_id}-{key}.nii.gz"
+            if nii.exists():
+                files[key] = nii
+            elif nii_gz.exists():
+                files[key] = nii_gz
+            else:
+                all_found = False
+                break
+        if all_found:
+            valid_cases.append({"case_id": case_id, "files": files})
+
+    print(f"Exporting seg probabilities for {len(valid_cases)} cases → {prob_dir}")
+
+    model.eval()
+    exported = 0
+    skipped = 0
+
+    with torch.no_grad():
+        for i, case in enumerate(valid_cases):
+            case_id = case["case_id"]
+            prob_path = prob_dir / f"{case_id}_seg_probs.npy"
+
+            # Skip if already cached
+            if prob_path.exists():
+                skipped += 1
+                continue
+
+            # Load native-resolution volumes
+            modality_vols = {}
+            for mod in config["modalities"]:
+                vol = load_volume(case["files"][mod])
+                modality_vols[mod] = zscore_normalize(vol)
+
+            H, W, D = modality_vols[config["modalities"][0]].shape
+            probs_3d = np.zeros((num_classes, H, W, D), dtype=np.float32)
+
+            for s in range(D):
+                # Extract 4-channel native slice
+                native_channels = []
+                for mod in config["modalities"]:
+                    native_channels.append(modality_vols[mod][:, :, s])
+                native_slice = np.stack(native_channels, axis=0)  # (4, H, W)
+
+                # Resize each channel to model input size
+                resized_channels = []
+                for c in range(4):
+                    resized = cv2.resize(
+                        native_slice[c],
+                        (img_size, img_size),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    resized_channels.append(resized)
+
+                input_tensor = (
+                    torch.from_numpy(np.stack(resized_channels, axis=0))
+                    .unsqueeze(0)
+                    .float()
+                    .to(SHARED["device"])
+                )  # (1, 4, 224, 224)
+
+                # Forward pass → softmax probabilities
+                logits = model(input_tensor)  # (1, num_classes, 224, 224)
+                probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
+
+                # Upsample each class probability map back to native resolution
+                for c in range(num_classes):
+                    probs_3d[c, :, :, s] = cv2.resize(
+                        probs[c],
+                        (W, H),                     # cv2 uses (width, height)
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+
+            np.save(str(prob_path), probs_3d)
+            del modality_vols, probs_3d
+            exported += 1
+
+            if (i + 1) % 20 == 0 or i == 0 or (i + 1) == len(valid_cases):
+                print(f"  [{i+1}/{len(valid_cases)}] exported={exported}, "
+                      f"cached={skipped}")
+
+    print(f"Done. Exported {exported} new, {skipped} cached → {prob_dir}")
+    return prob_dir
+
+
 # ── Visualization ─────────────────────────────────────────────────────
 
 def plot_test_results(test_meta, preds, gts, n=6):
-    """Plot GT vs predicted overlays for n random test slices."""
     indices = random.sample(range(len(preds)), min(n, len(preds)))
     fig, axes = plt.subplots(3, n, figsize=(4 * n, 12))
 
@@ -544,7 +621,6 @@ def plot_test_results(test_meta, preds, gts, n=6):
 
 
 def plot_confusion(preds, gts):
-    """Plot 4-class segmentation confusion matrix."""
     flat_p = np.concatenate([p.flatten() for p in preds])
     flat_g = np.concatenate([g.flatten() for g in gts])
     cm = confusion_matrix(flat_g, flat_p, labels=[0, 1, 2, 3])

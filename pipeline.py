@@ -1,15 +1,5 @@
-"""
-Unified Pipeline Orchestrator
-Prediction → Classification → Segmentation → GNN
-
-Each phase is independently trainable via its own module.
-This script chains them end-to-end.
-"""
-
 import torch
 import torch.nn as nn
-import numpy as np
-from pathlib import Path
 import time
 
 from config import SHARED, PREDICTION, CLASSIFICATION, SEGMENTATION, GNN, PIPELINE, ensure_dirs
@@ -17,7 +7,8 @@ from config import SHARED, PREDICTION, CLASSIFICATION, SEGMENTATION, GNN, PIPELI
 import prediction
 import classification
 import segmentation
-import gnn
+
+# TODO: Need to implement gnn pipeline
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -25,7 +16,6 @@ import gnn
 # ══════════════════════════════════════════════════════════════════════
 
 def run_prediction():
-    """Train binary tumor detector and return the model + test metrics."""
     print("\n" + "=" * 70)
     print("PHASE 1: BINARY PREDICTION")
     print("=" * 70)
@@ -59,7 +49,6 @@ def run_prediction():
 # ══════════════════════════════════════════════════════════════════════
 
 def run_classification(train_ds, val_ds, test_ds):
-    """Train 3-class tumor classifier and generate GradCAM pseudo-masks."""
     print("\n" + "=" * 70)
     print("PHASE 2: MULTI-CLASS CLASSIFICATION")
     print("=" * 70)
@@ -134,7 +123,6 @@ def run_classification(train_ds, val_ds, test_ds):
 # ══════════════════════════════════════════════════════════════════════
 
 def run_segmentation():
-    """Train BraTS segmentation model and export for GNN."""
     print("\n" + "=" * 70)
     print("PHASE 3: BRATS SEGMENTATION")
     print("=" * 70)
@@ -173,69 +161,8 @@ def run_segmentation():
 # ══════════════════════════════════════════════════════════════════════
 
 def run_gnn():
-    """Build 3D graphs, train OCN model, generate reasoning traces."""
-    print("\n" + "=" * 70)
-    print("PHASE 4: 3D GNN EDGE PREDICTION")
-    print("=" * 70)
-
-    train_graphs, val_graphs, test_graphs = gnn.build_all_graphs()
-    gnn.plot_3d_graphs(train_graphs)
-
-    model = gnn.EdgePredictor().to(SHARED["device"])
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"EdgePredictor | Parameters: {total_params:,}")
-
-    gnn.train_gnn(model, train_graphs, val_graphs)
-
-    # Test
-    model.load_state_dict(torch.load(str(GNN["checkpoint"]), weights_only=True))
-    sf_computer = gnn.StructuralFeatureComputer()
-    test_metrics = gnn.evaluate_gnn(model, test_graphs, sf_computer)
-
-    print(f"\nPhase 4 Test:")
-    print(f"  AUC-ROC: {test_metrics['auc']:.4f}")
-    print(f"  AP:      {test_metrics['ap']:.4f}")
-    print(f"  Intra:   {test_metrics['intra_auc']:.4f}")
-    print(f"  Inter:   {test_metrics['inter_auc']:.4f}")
-
-    # Reasoning traces
-    demo_graph = None
-    for g in test_graphs:
-        if g.edge_index.size(1) >= 10 and g.x.size(0) >= 5:
-            demo_graph = g
-            break
-    if demo_graph is None and len(test_graphs) > 0:
-        demo_graph = test_graphs[0]
-
-    if demo_graph is not None and demo_graph.edge_index.size(1) >= 2:
-        data = demo_graph.to(SHARED["device"])
-        pos_ei = data.edge_index
-        pos_sf, pos_cn = sf_computer.compute(demo_graph.edge_index, demo_graph.x.size(0), pos_ei)
-        pos_src_t, pos_dst_t, pos_inter = gnn.get_edge_metadata(demo_graph, pos_ei)
-
-        z, _, sv_attns = model.encode(data, return_attention=True)
-        pos_pred = model.decode(
-            z, pos_ei, pos_sf, pos_cn,
-            pos_src_t.to(SHARED["device"]),
-            pos_dst_t.to(SHARED["device"]),
-            pos_inter.to(SHARED["device"]),
-        )
-
-        trace_gen = gnn.ReasoningTraceGenerator()
-        traces = trace_gen.generate(
-            demo_graph, z, pos_pred, pos_sf, pos_cn,
-            pos_src_t, pos_dst_t, pos_inter, top_k=8,
-        )
-
-        print(f"\n--- Reasoning Traces for {demo_graph.case_id} ---")
-        for t in traces:
-            print(t)
-            print()
-
-        gnn.plot_results(demo_graph, pos_pred, test_metrics["tissue_pairs"],
-                         test_metrics["all_labels"], test_metrics["all_scores"])
-
-    return model, test_metrics
+    # TODO: Need to implement
+    pass
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -243,7 +170,6 @@ def run_gnn():
 # ══════════════════════════════════════════════════════════════════════
 
 def run_pipeline():
-    """Execute the full end-to-end pipeline: Pred → Clas → Seg → GNN."""
     start = time.time()
     ensure_dirs()
 

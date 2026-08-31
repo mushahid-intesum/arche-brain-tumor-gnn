@@ -1,9 +1,3 @@
-"""
-Phase 2: Multi-class Tumor Classification
-ConvNeXt-Base 3-class classifier (glioma, meningioma, pituitary) + GradCAM pseudo-masks.
-Dataset: Brain MRI ND-5 (tumor-only subset)
-"""
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -28,8 +22,6 @@ from prediction import (
 # ── Loss ──────────────────────────────────────────────────────────────
 
 class FocalLoss(nn.Module):
-    """Focal loss for class-imbalanced classification."""
-
     def __init__(self, alpha=None, gamma=2.0, reduction="mean"):
         super().__init__()
         self.alpha = alpha
@@ -50,8 +42,6 @@ class FocalLoss(nn.Module):
 # ── Model ─────────────────────────────────────────────────────────────
 
 class DualPoolConvNeXt(nn.Module):
-    """ConvNeXt with avg+max dual pooling for 3-class tumor classification."""
-
     def __init__(self, base, feat_dim):
         super().__init__()
         self.features = base.features
@@ -74,7 +64,6 @@ class DualPoolConvNeXt(nn.Module):
 
 
 def build_multiclass_classifier(device=None):
-    """Build DualPoolConvNeXt for 3-class tumor type classification."""
     device = device or SHARED["device"]
     backbone = models.convnext_base(weights=ConvNeXt_Base_Weights.IMAGENET1K_V1)
     in_features = backbone.classifier[2].in_features
@@ -86,8 +75,6 @@ def build_multiclass_classifier(device=None):
 # ── GradCAM ───────────────────────────────────────────────────────────
 
 class GradCAM:
-    """Gradient-weighted Class Activation Map for pseudo-mask generation."""
-
     def __init__(self, model, target_layer):
         self.model = model
         self.gradients = None
@@ -132,7 +119,6 @@ class GradCAM:
 # ── Training ──────────────────────────────────────────────────────────
 
 def train_one_epoch(model, loader, criterion, optimizer, scheduler, accum_steps=1):
-    """Single training epoch for multiclass classification."""
     model.train()
     total_loss, correct, total = 0, 0, 0
     optimizer.zero_grad()
@@ -155,7 +141,6 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, accum_steps=
 
 @torch.no_grad()
 def evaluate(model, loader, criterion):
-    """Evaluate multiclass classification on a loader."""
     model.eval()
     total_loss, correct, total = 0, 0, 0
     all_preds, all_labels = [], []
@@ -178,7 +163,6 @@ def evaluate(model, loader, criterion):
 
 
 def train_multiclass(model, train_loader, val_loader, class_weights, config=None):
-    """Full training loop with freeze/unfreeze and focal loss."""
     config = config or CLASSIFICATION
     criterion = FocalLoss(
         alpha=class_weights.to(SHARED["device"]),
@@ -237,7 +221,6 @@ def train_multiclass(model, train_loader, val_loader, class_weights, config=None
 
 
 def predict_class(model, image_tensor):
-    """Run multiclass prediction on a single image tensor. Returns dict."""
     model.eval()
     with torch.no_grad():
         out = model(image_tensor)
@@ -251,7 +234,6 @@ def predict_class(model, image_tensor):
 
 
 def generate_pseudo_masks(model, data_root, mask_dir, config=None):
-    """Generate GradCAM-based pseudo segmentation masks."""
     config = config or CLASSIFICATION
     _, val_transform = get_transforms()
 
@@ -291,7 +273,6 @@ def generate_pseudo_masks(model, data_root, mask_dir, config=None):
 # ── Visualization ─────────────────────────────────────────────────────
 
 def plot_confusion_matrix(labels, preds, class_names, title="Classification Confusion Matrix"):
-    """Plot NxN confusion matrix."""
     cm = confusion_matrix(labels, preds)
     fig, ax = plt.subplots(figsize=(7, 6))
     im = ax.imshow(cm, cmap="Blues")

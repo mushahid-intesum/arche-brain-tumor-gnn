@@ -1,9 +1,3 @@
-"""
-Phase 1: Binary Tumor Prediction
-ConvNeXt-Base binary classifier — tumor vs. no tumor.
-Dataset: Brain MRI ND-5
-"""
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -29,8 +23,6 @@ from config import SHARED, PREDICTION
 # ── Data ──────────────────────────────────────────────────────────────
 
 class BrainMRIDataset(Dataset):
-    """Brain MRI ND-5 dataset with binary + multiclass labels."""
-
     CLASS_TO_IDX = {
         "glioma_tumor": 0,
         "meningioma_tumor": 1,
@@ -75,8 +67,6 @@ class BrainMRIDataset(Dataset):
 
 
 class TransformSubset(Dataset):
-    """Subset with a separate transform (for train/val augmentation split)."""
-
     def __init__(self, dataset, indices, transform):
         self.dataset = dataset
         self.indices = indices
@@ -103,7 +93,6 @@ class TransformSubset(Dataset):
 
 
 def load_image(img_path):
-    """Load image with mode handling (I, RGBA, etc.)."""
     img = Image.open(img_path)
     if img.mode == "I":
         arr = np.array(img, dtype=np.float32)
@@ -119,7 +108,6 @@ def load_image(img_path):
 
 
 def get_transforms():
-    """Return train and val/test transforms."""
     train_transform = T.Compose([
         T.RandomResizedCrop(SHARED["img_size"], scale=(0.7, 1.0), ratio=(0.9, 1.1)),
         T.RandomHorizontalFlip(p=0.5),
@@ -139,7 +127,6 @@ def get_transforms():
 
 
 def create_dataloaders(data_root, batch_size, num_workers, val_split):
-    """Create train/val/test dataloaders with stratified split."""
     train_transform, val_transform = get_transforms()
 
     full_train = BrainMRIDataset(data_root / "Training", transform=None)
@@ -163,7 +150,6 @@ def create_dataloaders(data_root, batch_size, num_workers, val_split):
 
 
 def denormalize(tensor):
-    """Undo ImageNet normalization for visualization."""
     mean = torch.tensor(SHARED["imagenet_mean"])
     std = torch.tensor(SHARED["imagenet_std"])
     return tensor * std[:, None, None] + mean[:, None, None]
@@ -172,7 +158,6 @@ def denormalize(tensor):
 # ── Model ─────────────────────────────────────────────────────────────
 
 def build_binary_classifier(device=None):
-    """ConvNeXt-Base with binary classification head."""
     device = device or SHARED["device"]
     backbone = models.convnext_base(weights=ConvNeXt_Base_Weights.IMAGENET1K_V1)
     in_features = backbone.classifier[2].in_features
@@ -191,7 +176,6 @@ def build_binary_classifier(device=None):
 # ── Training ──────────────────────────────────────────────────────────
 
 def train_one_epoch(model, loader, criterion, optimizer, scheduler, accum_steps=1):
-    """Single training epoch for binary prediction."""
     model.train()
     total_loss, correct, total = 0, 0, 0
     optimizer.zero_grad()
@@ -215,7 +199,6 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, accum_steps=
 
 @torch.no_grad()
 def evaluate(model, loader, criterion):
-    """Evaluate binary prediction on a loader."""
     model.eval()
     total_loss, correct, total = 0, 0, 0
     all_preds, all_labels, all_probs = [], [], []
@@ -242,7 +225,6 @@ def evaluate(model, loader, criterion):
 
 
 def train_binary(model, train_loader, val_loader, config=None):
-    """Full training loop with freeze/unfreeze schedule."""
     config = config or PREDICTION
     criterion = nn.BCEWithLogitsLoss()
 
@@ -298,7 +280,6 @@ def train_binary(model, train_loader, val_loader, config=None):
 
 
 def predict(model, image_tensor):
-    """Run binary prediction on a single image tensor. Returns dict."""
     model.eval()
     with torch.no_grad():
         out = model(image_tensor).squeeze()
@@ -309,7 +290,6 @@ def predict(model, image_tensor):
 # ── Visualization ─────────────────────────────────────────────────────
 
 def plot_confusion_matrix(labels, preds, title="Binary Confusion Matrix"):
-    """Plot 2x2 confusion matrix."""
     cm = confusion_matrix(labels, preds)
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(cm, cmap="Blues")

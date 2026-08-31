@@ -265,7 +265,8 @@ def compute_laplacian_pe(edge_index, num_nodes, k=None):
 
     # Degree matrix
     deg = np.array(A.sum(axis=1)).flatten()
-    deg_inv_sqrt = np.where(deg > 0, 1.0 / np.sqrt(deg), 0.0)
+    deg_sqrt = np.sqrt(np.maximum(deg, 1e-12))
+    deg_inv_sqrt = np.where(deg > 0, 1.0 / deg_sqrt, 0.0)
 
     # Normalized Laplacian: I - D^{-1/2} A D^{-1/2}
     from scipy.sparse import diags
@@ -295,7 +296,7 @@ def compute_laplacian_pe(edge_index, num_nodes, k=None):
     except Exception:
         pe = np.zeros((num_nodes, k))
 
-    return torch.from_numpy(pe).float()
+    return torch.from_numpy(np.nan_to_num(pe, nan=0.0)).float()
 
 
 # ── Full Model ───────────────────────────────────────────────────────

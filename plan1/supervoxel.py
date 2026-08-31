@@ -475,8 +475,8 @@ def compute_edge_targets(edge_index, targets, idx_to_label):
         "same_class_edges": int(y_binary.sum()),
         "diff_class_edges": int((1 - y_binary).sum()),
         "boundary_type_distribution": type_counts,
-        "mean_gradient": float(y_grad.mean()),
-        "max_gradient": float(y_grad.max()),
+        "mean_gradient": float(y_grad.mean()) if E > 0 else 0.0,
+        "max_gradient": float(y_grad.max()) if E > 0 else 0.0,
     }
 
     edge_targets = {
